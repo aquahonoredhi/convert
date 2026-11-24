@@ -1,7 +1,12 @@
 import { buildPresentation, parseZip, renderSlide } from "@aiden0z/pptx-renderer";
 import { jsPDF } from "jspdf";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
+import { changeExt } from "src/common/index.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
+import { numberOption } from "src/Settings.ts";
+
+const DEFAULT_SCALE = 2;
 
 async function waitForSlideToSettle(element: HTMLElement): Promise<void> {
   const imagePromises = Array.from(element.querySelectorAll("img"))
@@ -36,29 +41,33 @@ async function canvasToPngDataUrl(canvas: HTMLCanvasElement): Promise<string> {
 
   return await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
-    reader.addEventListener("load", () => resolve(String(reader.result)));
+    reader.addEventListener("load", () =>
+      typeof reader.result === "string"
+        ? resolve(reader.result)
+        : reject(new Error("Could not read the slide as a data URL.")),
+    );
     reader.addEventListener("error", () => reject(reader.error));
     reader.readAsDataURL(blob);
   });
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const sliced = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  return sliced as ArrayBuffer;
+  return bytes.slice().buffer;
 }
 
 export default class pptxRendererHandler implements FormatHandler {
-  public name: string = "pptxRenderer";
-
-  public ready: boolean = false;
-  public offload: boolean = false; // dom heavy
+  public readonly name = "pptxRenderer";
+  public supportedFormats = [
+    Formats.PPTX.builder("pptx").from(),
+    Formats.PDF.builder("pdf")
+      .options({ scale: { type: "number", label: "Render scale", unit: "×", min: 0.5, max: 4 } })
+      .to(),
+  ];
+  public ready = false;
+  public offload = false; // dom heavy
+  public abortable = true;
 
   private html2canvas?: any;
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PPTX.supported("pptx", true, false),
-    CommonFormats.PDF.supported("pdf", false, true),
-  ];
 
   async init() {
     this.html2canvas = (await import("html2canvas")).default;
@@ -69,7 +78,7 @@ export default class pptxRendererHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    _args?: string[],
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     if (!this.ready) throw new Error("Handler not initialized.");
     if (inputFormat.internal !== "pptx" || outputFormat.internal !== "pdf") {
@@ -77,6 +86,7 @@ export default class pptxRendererHandler implements FormatHandler {
     }
 
     const outputFiles: FileData[] = [];
+    const scale = numberOption(ctx?.options, "scale") ?? DEFAULT_SCALE;
     const stagingRoot = document.createElement("div");
     stagingRoot.style.position = "fixed";
     stagingRoot.style.left = "-20000px";
@@ -88,6 +98,7 @@ export default class pptxRendererHandler implements FormatHandler {
 
     try {
       for (const inputFile of inputFiles) {
+        await ctx?.checkpoint();
         const files = await parseZip(toArrayBuffer(inputFile.bytes));
         const presentation = buildPresentation(files);
 
@@ -106,6 +117,7 @@ export default class pptxRendererHandler implements FormatHandler {
         const mediaUrlCache = new Map<string, string>();
 
         for (const [slideIndex, slide] of presentation.slides.entries()) {
+          await ctx?.checkpoint();
           const handle = renderSlide(presentation, slide, { mediaUrlCache });
           try {
             stagingRoot.replaceChildren();
@@ -114,10 +126,11 @@ export default class pptxRendererHandler implements FormatHandler {
             stagingRoot.appendChild(handle.element);
 
             await waitForSlideToSettle(handle.element);
+            await ctx?.checkpoint();
 
             const canvas = await this.html2canvas(handle.element, {
               backgroundColor: "#ffffff",
-              scale: 2,
+              scale,
               useCORS: true,
               logging: false,
               width: presentation.width,
@@ -147,9 +160,8 @@ export default class pptxRendererHandler implements FormatHandler {
         }
 
         const pdfBytes = new Uint8Array(pdf.output("arraybuffer"));
-        const baseName = inputFile.name.replace(/\.[^.]+$/u, "");
         outputFiles.push({
-          name: `${baseName}.pdf`,
+          name: changeExt(inputFile.name, "pdf"),
           bytes: pdfBytes,
         });
       }

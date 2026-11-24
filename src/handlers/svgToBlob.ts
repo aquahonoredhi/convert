@@ -1,40 +1,46 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import { InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { canvasToBlob, createCanvas, resolveSize, type CanvasBundle } from "src/common/canvas.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
 
 class svgToBlobHandler implements FormatHandler {
-  public name: string = "svgToBlob";
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PNG.supported("png", false, true),
-    CommonFormats.JPEG.supported("jpeg", false, true),
-    CommonFormats.WEBP.supported("webp", false, true),
-    CommonFormats.SVG.supported("svg", true, false),
+  public readonly name = "svgToBlob";
+  public supportedFormats = [
+    Formats.PNG.builder("png").options({ width: true, height: true }).to(),
+    Formats.JPEG.builder("jpeg").options({ width: true, height: true }).to(),
+    Formats.WEBP.builder("webp").options({ width: true, height: true }).to(),
+    Formats.SVG.builder("svg").from(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = false; // svg does not like createImageBitmap
+  public ready = false;
+  public offload = false; // svg does not like createImageBitmap
+  public abortable = true;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
     this.ready = true;
-    this.#canvas = new OffscreenCanvas(1, 1);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas();
   }
 
   async doConvert(
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    convertCtx?: ConvertContext,
   ): Promise<FileData[]> {
-    if (!this.#canvas || !this.#ctx) {
+    const options = convertCtx?.options;
+    if (!this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { canvas, ctx } = this.#bundle;
 
     const outputFiles: FileData[] = [];
     for (const inputFile of inputFiles) {
+      await convertCtx?.checkpoint();
       // avoid the "Tainted canvases may not be exported" error
-      const url = `data:${inputFormat.mime};base64,${btoa(inputFile.bytes.reduce((str, byte) => str + String.fromCharCode(byte), ""))}`;
+      const url = `data:${inputFormat.mime};base64,${inputFile.bytes.toBase64()}`;
 
       const image = new Image();
       await new Promise((resolve, reject) => {
@@ -43,15 +49,17 @@ class svgToBlobHandler implements FormatHandler {
         image.src = url;
       });
 
-      this.#canvas.width = image.naturalWidth;
-      this.#canvas.height = image.naturalHeight;
-      this.#ctx.drawImage(image, 0, 0);
+      const { width, height } = resolveSize(image.naturalWidth, image.naturalHeight, options);
+      canvas.width = width;
+      canvas.height = height;
+      if (outputFormat.mime === "image/jpeg") {
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, width, height);
+      }
+      ctx.drawImage(image, 0, 0, width, height);
 
-      const blob = await this.#canvas.convertToBlob({
-        type: outputFormat.mime,
-      });
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const name = inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+      const bytes = await canvasToBlob(this.#bundle, outputFormat.mime);
+      const name = changeExt(inputFile.name, outputFormat.extension);
 
       outputFiles.push({ bytes, name });
     }

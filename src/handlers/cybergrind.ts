@@ -1,35 +1,19 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { InitializationError } from "src/errors.ts";
+import { changeExt, encode } from "src/common/index.ts";
+import { createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 class cybergrindHandler implements FormatHandler {
-  public name: string = "cybergrind";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "cybergrind";
+  public supportedFormats = [Formats.PNG.builder("png").from(), Formats.CGP.builder("cgp").to()];
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.PNG.supported("png", true, false),
-      {
-        name: "ULTRAKILL CyberGrind Pattern",
-        format: "cgp",
-        extension: "cgp",
-        mime: "text/plain",
-        category: Category.DATA,
-        from: false,
-        to: true,
-        internal: "cgp",
-        lossless: false,
-      },
-    ];
-
-    this.#canvas = new OffscreenCanvas(16, 16);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas(16, 16);
 
     this.ready = true;
   }
@@ -39,26 +23,26 @@ class cybergrindHandler implements FormatHandler {
     inputFormat: FileFormat,
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
-    const encoder = new TextEncoder();
     const outputFiles: FileData[] = [];
 
     if (inputFormat.internal !== "png" || outputFormat.internal !== "cgp") {
       throw new TypeError(`Unsupported output format: ${outputFormat.internal}`);
     }
-    if (!this.#canvas || !this.#ctx) {
+    if (!this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { canvas, ctx } = this.#bundle;
 
     for (const file of inputFiles) {
       // take img and load
-      const blob = new Blob([file.bytes as BlobPart], { type: inputFormat.mime });
+      const blob = new Blob([file.bytes], { type: inputFormat.mime });
       const image = await createImageBitmap(blob);
 
       // make canvas with 16x16
-      this.#canvas.width = 16;
-      this.#canvas.height = 16;
-      this.#ctx.drawImage(image, 0, 0, 16, 16);
-      const pixels = this.#ctx.getImageData(0, 0, 16, 16);
+      canvas.width = 16;
+      canvas.height = 16;
+      ctx.drawImage(image, 0, 0, 16, 16);
+      const pixels = ctx.getImageData(0, 0, 16, 16);
 
       // mcmap's canvas logic used as a base!
 
@@ -102,7 +86,7 @@ class cybergrindHandler implements FormatHandler {
         }
 
         const height = heights[index];
-        cyberHeights += `${height >= 10 ? `(${height})` : `${height}`}`;
+        cyberHeights += height >= 10 ? `(${height})` : `${height}`;
         // H is Hideous mass, n is melee, p is ranged
         // H is last so it will be less likely to exist
         enemyThing += blues.some((x) => x.index === index)
@@ -110,12 +94,12 @@ class cybergrindHandler implements FormatHandler {
           : greens.some((x) => x.index === index)
             ? "n"
             : reds.some((x) => x.index === index)
-              ? "H"
+              ? "p"
               : "0";
       }
 
-      const outputBytes = encoder.encode(cyberHeights + "\n\n" + enemyThing);
-      const newName = file.name.replace(/\.[^/.]+$/, "") + ".cgp"; // name renaming stolen from textToPy.ts
+      const outputBytes = encode(cyberHeights + "\n\n" + enemyThing);
+      const newName = changeExt(file.name, "cgp");
 
       outputFiles.push({ bytes: outputBytes, name: newName });
     }

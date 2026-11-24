@@ -1,26 +1,15 @@
-import { FormatDefinition } from "../FormatHandler.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
-import { encode, decode } from "@toon-format/toon";
-
-const toonFormat = new FormatDefinition(
-  "Token-Oriented Object Notation",
-  "toon",
-  "toon",
-  "text/toon",
-  Category.DATA,
-);
+import Formats from "src/Formats.ts";
+import { encode as encodeToon, decode as decodeToon } from "@toon-format/toon";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 class toonHandler implements FormatHandler {
-  public name: string = "toon";
-
-  public supportedFormats?: FileFormat[] = [
-    CommonFormats.JSON.supported("json", true, true, true),
-    toonFormat.supported("toon", true, true, true),
+  public readonly name = "toon";
+  public supportedFormats = [
+    Formats.JSON.builder("json").lossless().fromTo(),
+    Formats.TOON.builder("toon").lossless().fromTo(),
   ];
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -32,38 +21,38 @@ class toonHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     switch (inputFormat.mime) {
-      case CommonFormats.JSON.mime:
-        if (outputFormat.mime !== toonFormat.mime) {
+      case Formats.JSON.mime:
+        if (outputFormat.mime !== Formats.TOON.mime) {
           throw new TypeError(`Unsupported output format MIME: ${outputFormat.mime}`);
         }
 
         return inputFiles.map((file) => {
-          const text = new TextDecoder().decode(file.bytes);
+          const text = decode(file.bytes);
           let jsonData = JSON.parse(text);
 
-          const toonData = encode(jsonData);
-          const name = file.name.split(".").slice(0, -1).join(".") + ".toon";
+          const toonData = encodeToon(jsonData);
+          const name = changeExt(file.name, "toon");
 
           return {
             name,
-            bytes: new TextEncoder().encode(toonData),
+            bytes: encode(toonData),
           };
         });
 
-      case toonFormat.mime:
-        if (outputFormat.mime !== CommonFormats.JSON.mime) {
+      case Formats.TOON.mime:
+        if (outputFormat.mime !== Formats.JSON.mime) {
           throw new TypeError(`Unsupported output format MIME: ${outputFormat.mime}`);
         }
 
         return inputFiles.map((file) => {
-          const toonData = new TextDecoder().decode(file.bytes);
-          const jsonData = JSON.stringify(decode(toonData));
+          const toonData = decode(file.bytes);
+          const jsonData = JSON.stringify(decodeToon(toonData));
 
-          const name = file.name.split(".").slice(0, -1).join(".") + ".json";
+          const name = changeExt(file.name, "json");
 
           return {
             name,
-            bytes: new TextEncoder().encode(jsonData),
+            bytes: encode(jsonData),
           };
         });
 

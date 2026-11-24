@@ -1,11 +1,15 @@
 import * as vexml from "@stringsync/vexml";
 import VexFlow from "vexflow";
-import { DOMParser as WorkerDOMParser, Document } from "linkedom/worker";
+import { Document } from "linkedom/worker";
+import { WorkerDOMParser } from "src/common/dom.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { buildMidi, addNote } from "./midi/midifilelib.js";
+import bravuraUrl from "@vexflow-fonts/bravura/bravura.woff2?url";
+import academicoUrl from "@vexflow-fonts/academico/academico.woff2?url";
+import { changeExt, decode, encode, ownedBytes } from "src/common/index.ts";
 
-const DOMParser = WorkerDOMParser as unknown as typeof globalThis.DOMParser;
+const DOMParser = WorkerDOMParser;
 
 // Note name to MIDI number mapping
 function noteToMidi(step: string, octave: number, alter: number = 0): number {
@@ -20,16 +24,17 @@ function renderCanvases(xml: string): OffscreenCanvas[] {
   const canvases = new Map<Element, OffscreenCanvas>();
 
   const createElement = renderDocument.createElement.bind(renderDocument);
-  renderDocument.createElement = ((tag: string) => {
-    const element = createElement(tag);
-    if (tag === "canvas") {
-      const canvas = new OffscreenCanvas(300, 150);
-      (element as HTMLCanvasElement).getContext = (() =>
-        canvas.getContext("2d")) as HTMLCanvasElement["getContext"];
-      canvases.set(element, canvas);
-    }
-    return element;
-  }) as typeof renderDocument.createElement;
+  Object.assign(renderDocument, {
+    createElement(tag: string) {
+      const element = createElement(tag);
+      if (tag === "canvas") {
+        const canvas = new OffscreenCanvas(300, 150);
+        Object.assign(element, { getContext: () => canvas.getContext("2d") });
+        canvases.set(element, canvas);
+      }
+      return element;
+    },
+  });
   VexFlow.Element.setTextMeasurementCanvas(new OffscreenCanvas(300, 150));
   // VexML's DOM wrapper is synchronous; don't leave these globals in the shared worker.
   Object.assign(globalThis, { document: renderDocument, Document, DOMParser });
@@ -47,35 +52,29 @@ function renderCanvases(xml: string): OffscreenCanvas[] {
   }
 }
 
+function durationTicksOf(el: Element, ticksPerDivision: number) {
+  const durationEl = el.querySelector("duration");
+  const duration = durationEl ? parseInt(durationEl.textContent || "0") : 0;
+  return Math.round((Number.isFinite(duration) ? duration : 0) * ticksPerDivision);
+}
+
 class vexFlowHandler implements FormatHandler {
-  public name: string = "vexFlow";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "vexFlow";
+  public supportedFormats = [
+    Formats.MUSICXML.builder("musicxml").from(),
+    Formats.MXL.builder("mxl").from(),
+    Formats.HTML.builder("html").to(),
+    Formats.MIDI.builder("mid").to(),
+  ];
+  public ready = false;
   private static fontsLoaded = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.MUSICXML.builder("musicxml").allowFrom(),
-      CommonFormats.MXL.builder("mxl").allowFrom(),
-      CommonFormats.HTML.builder("html").allowTo(),
-      {
-        name: "MIDI",
-        format: "mid",
-        extension: "mid",
-        mime: "audio/midi",
-        from: false,
-        to: true,
-        internal: "mid",
-        category: Category.AUDIO,
-        lossless: false,
-      },
-    ];
-
     // Load VexFlow fonts (required for VexFlow 5)
     if (!vexFlowHandler.fontsLoaded) {
       try {
-        await VexFlow.loadFonts("Bravura", "Academico");
+        await VexFlow.Font.load("Bravura", bravuraUrl);
+        await VexFlow.Font.load("Academico", academicoUrl);
         vexFlowHandler.fontsLoaded = true;
         console.log("VexFlow fonts loaded successfully");
       } catch (e) {
@@ -171,21 +170,31 @@ class vexFlowHandler implements FormatHandler {
       const measures = part.querySelectorAll("measure");
       console.log(`Part ${partIndex}: ${measures.length} measure(s)`);
 
-      measures.forEach((measure, _measureIndex) => {
-        const notes = measure.querySelectorAll("note");
+      let lastNoteStartTick = 0;
 
-        notes.forEach((note) => {
+      measures.forEach((measure, _measureIndex) => {
+        Array.from(measure.children).forEach((note) => {
+          const tag = note.localName;
+          if (tag === "backup") {
+            partTick = Math.max(0, partTick - durationTicksOf(note, ticksPerDivision));
+            return;
+          }
+          if (tag === "forward") {
+            partTick += durationTicksOf(note, ticksPerDivision);
+            return;
+          }
+          if (tag !== "note") return;
+
           const isRest = note.querySelector("rest") !== null;
           const isChord = note.querySelector("chord") !== null;
 
-          // Get duration
-          const durationEl = note.querySelector("duration");
-          const duration = durationEl ? parseInt(durationEl.textContent || "0") : 0;
-          const durationTicks = Math.round(duration * ticksPerDivision);
+          const durationTicks = durationTicksOf(note, ticksPerDivision);
 
-          // For non-chord notes, this is where the note starts
-          // For chord notes, we need to use the previous note's start time
-          let noteStartTick = partTick;
+          const noteStartTick = isChord ? lastNoteStartTick : partTick;
+          if (!isChord) {
+            lastNoteStartTick = partTick;
+            partTick += durationTicks;
+          }
 
           if (!isRest) {
             const pitchEl = note.querySelector("pitch");
@@ -232,11 +241,6 @@ class vexFlowHandler implements FormatHandler {
                 addNote(events, track, channel, noteStartTick, midiNote, durationTicks, velocity);
               }
             }
-          }
-
-          // Only advance time if this is not a chord note
-          if (!isChord) {
-            partTick += durationTicks;
           }
         });
       });
@@ -362,7 +366,7 @@ class vexFlowHandler implements FormatHandler {
           console.log("XML starts with:", xmlString.substring(0, 200));
         } else {
           // Uncompressed MusicXML format
-          xmlString = new TextDecoder().decode(inputFile.bytes);
+          xmlString = decode(inputFile.bytes);
         }
 
         // Handle MIDI output
@@ -388,15 +392,16 @@ class vexFlowHandler implements FormatHandler {
             throw new Error("Failed to generate valid MIDI file");
           }
 
-          const name = inputFile.name.replace(/\.(musicxml|mxl|xml)$/i, ".mid");
-          outputFiles.push({ bytes: midiBytes, name });
+          const name = changeExt(inputFile.name, "mid");
+          outputFiles.push({ bytes: ownedBytes(midiBytes), name });
           continue;
         }
 
         // Handle HTML output
         // Ensure fonts are loaded before rendering
         if (!vexFlowHandler.fontsLoaded) {
-          await VexFlow.loadFonts("Bravura", "Academico");
+          await VexFlow.Font.load("Bravura", bravuraUrl);
+          await VexFlow.Font.load("Academico", academicoUrl);
           vexFlowHandler.fontsLoaded = true;
         }
         VexFlow.setFonts("Bravura", "Academico");
@@ -411,7 +416,11 @@ class vexFlowHandler implements FormatHandler {
           const blob = await canvas.convertToBlob({ type: "image/png" });
           return new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
-            reader.addEventListener("load", () => resolve(reader.result as string));
+            reader.addEventListener("load", () =>
+              typeof reader.result === "string"
+                ? resolve(reader.result)
+                : reject(new Error("Could not read the image as a data URL.")),
+            );
             reader.addEventListener("error", () => reject(reader.error));
             reader.readAsDataURL(blob);
           });
@@ -463,8 +472,8 @@ class vexFlowHandler implements FormatHandler {
 </html>`;
 
         // Convert HTML to Uint8Array
-        const bytes = new TextEncoder().encode(html);
-        const name = inputFile.name.replace(/\.(musicxml|mxl|xml)$/i, ".html");
+        const bytes = encode(html);
+        const name = changeExt(inputFile.name, "html");
 
         outputFiles.push({ bytes, name });
       } catch (error) {

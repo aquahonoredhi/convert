@@ -1,8 +1,9 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
 import * as THREE from "three";
 import { OBJExporter } from "three/addons/exporters/OBJExporter.js";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 type OutlinerEntry = string | BBModelGroup;
 type BBModelCubeFace = "north" | "south" | "east" | "west" | "up" | "down";
@@ -56,13 +57,23 @@ function isNodeVisible(node: BBModelNodeBase) {
 }
 
 function isCubeElement(element: BBModelElement): element is BBModelCube {
-  return Array.isArray((element as BBModelCube).from) && Array.isArray((element as BBModelCube).to);
+  return (
+    "from" in element && Array.isArray(element.from) && "to" in element && Array.isArray(element.to)
+  );
 }
 
 function isMeshElement(element: BBModelElement): element is BBModelMesh {
+  return "vertices" in element && typeof element.vertices === "object" && element.vertices !== null;
+}
+
+const isOptionalArray = (value: object, key: string) =>
+  !(key in value) || Array.isArray(Reflect.get(value, key));
+
+function isBBModel(value: unknown): value is BBModel {
   return (
-    typeof (element as BBModelMesh).vertices === "object" &&
-    (element as BBModelMesh).vertices !== null
+    typeof value === "object" &&
+    value !== null &&
+    ["elements", "groups", "outliner"].every((key) => isOptionalArray(value, key))
   );
 }
 
@@ -291,35 +302,19 @@ export function bbmodelToObject(model: BBModel) {
 }
 
 export function bbmodelToObj(input: string | BBModel) {
-  const model = typeof input === "string" ? (JSON.parse(input) as BBModel) : input;
+  const model: unknown = typeof input === "string" ? JSON.parse(input) : input;
+  if (!isBBModel(model)) throw new Error("Not a Blockbench model.");
   const exporter = new OBJExporter();
   return exporter.parse(bbmodelToObject(model));
 }
 
 class bbmodelHandler implements FormatHandler {
-  public name: string = "bbmodel";
-  public ready: boolean = false;
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "Wavefront OBJ",
-      format: "obj",
-      extension: "obj",
-      mime: "model/obj",
-      from: false,
-      to: true,
-      internal: "obj",
-      category: "model",
-      lossless: false,
-    },
-    CommonFormats.JSON.builder("bbmodel")
-      .named("Blockbench Project")
-      .withFormat("bbmodel")
-      .withExt("bbmodel")
-      .withCategory("model")
-      .allowFrom(true)
-      .allowTo(false),
+  public readonly name = "bbmodel";
+  public supportedFormats = [
+    Formats.OBJ.builder("obj").to(),
+    Formats.BBMODEL.builder("bbmodel").from(),
   ];
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -335,11 +330,10 @@ class bbmodelHandler implements FormatHandler {
     }
 
     return inputFiles.map((file) => {
-      const baseName = file.name.replace(/\.[^.]+$/u, "");
-      const text = new TextDecoder().decode(file.bytes);
-      const bytes = new TextEncoder().encode(bbmodelToObj(text));
+      const text = decode(file.bytes);
+      const bytes = encode(bbmodelToObj(text));
       return {
-        name: `${baseName}.${outputFormat.extension}`,
+        name: changeExt(file.name, outputFormat.extension),
         bytes,
       };
     });

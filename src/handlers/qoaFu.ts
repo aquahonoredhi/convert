@@ -1,7 +1,8 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { QOAEncoder, QOADecoder, QOABase } from "qoa-fu";
-import { WaveFile } from "wavefile";
+import { changeExt, ownedBytes } from "src/common/index.ts";
+import { typedWaveFile } from "src/common/wav.ts";
 
 class uint8ArrayQOADecoder extends QOADecoder {
   private data: Uint8Array;
@@ -25,7 +26,7 @@ class uint8ArrayQOADecoder extends QOADecoder {
 }
 
 class uint8ArrayQOAEncoder extends QOAEncoder {
-  private buffer: Uint8Array;
+  private buffer: Uint8Array<ArrayBuffer>;
   private pos = 0;
 
   constructor(estimatedSize: number) {
@@ -40,29 +41,18 @@ class uint8ArrayQOAEncoder extends QOAEncoder {
     return true;
   }
 
-  public getData(): Uint8Array {
+  public getData(): Uint8Array<ArrayBuffer> {
     return this.buffer.subarray(0, this.pos);
   }
 }
 
 class qoaFuHandler implements FormatHandler {
-  public name: string = "qoaFu";
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "Quite OK Audio",
-      format: "qoa",
-      extension: "qoa",
-      mime: "audio/x-qoa", // I have to put something here
-      from: true,
-      to: true,
-      internal: "qoa",
-      category: Category.AUDIO,
-      lossless: false,
-    },
-    CommonFormats.WAV.builder("wav").allowFrom(true).allowTo(true),
+  public readonly name = "qoaFu";
+  public supportedFormats = [
+    Formats.QOA.builder("qoa").fromTo(),
+    Formats.WAV.builder("wav").fromTo(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -85,52 +75,51 @@ class qoaFuHandler implements FormatHandler {
         const audioData = new Int16Array(decoder.getTotalSamples() * decoder.getChannels());
         let pos = 0;
         while (!decoder.isEnd()) {
-          pos +=
-            decoder.readFrame(
-              audioData.subarray(
-                pos,
-                Math.min(
-                  QOABase.MAX_FRAME_SAMPLES * decoder.getChannels() + pos,
-                  decoder.getTotalSamples() * decoder.getChannels(),
-                ),
+          const frameSamples = decoder.readFrame(
+            audioData.subarray(
+              pos,
+              Math.min(
+                QOABase.MAX_FRAME_SAMPLES * decoder.getChannels() + pos,
+                decoder.getTotalSamples() * decoder.getChannels(),
               ),
-            ) * decoder.getChannels();
+            ),
+          );
+          if (frameSamples <= 0) {
+            throw new Error(`Invalid or truncated QOA frame in "${inputFile.name}".`);
+          }
+          pos += frameSamples * decoder.getChannels();
         }
 
-        const wav = new WaveFile();
+        const wav = typedWaveFile();
         wav.fromScratch(decoder.getChannels(), decoder.getSampleRate(), "16", audioData);
 
-        const wavBytes = wav.toBuffer();
-        const name = inputFile.name.split(".").slice(0, -1).join(".") + ".wav";
+        const wavBytes = ownedBytes(wav.toBuffer());
+        const name = changeExt(inputFile.name, "wav");
         outputFiles.push({ bytes: wavBytes, name });
       }
     } else if (inputFormat.internal === "wav" && outputFormat.internal === "qoa") {
       // WAV => QOA
       for (const inputFile of inputFiles) {
-        const wav = new WaveFile(inputFile.bytes);
+        const wav = typedWaveFile(inputFile.bytes);
         wav.toBitDepth("32f");
-        const wavData = wav.data as { samples: Uint8Array }; // idiot library
-        const wavFmt = wav.fmt as { sampleRate: number; numChannels: number; blockAlign: number };
-        const length = wavData.samples.length / wavFmt.blockAlign;
+        const length = wav.data.samples.length / wav.fmt.blockAlign;
 
-        const encoder = new uint8ArrayQOAEncoder((length * wavFmt.numChannels * 4) / 8 + 4096);
-        if (!encoder.writeHeader(length, wavFmt.numChannels, wavFmt.sampleRate)) {
+        const encoder = new uint8ArrayQOAEncoder((length * wav.fmt.numChannels * 4) / 8 + 4096);
+        if (!encoder.writeHeader(length, wav.fmt.numChannels, wav.fmt.sampleRate)) {
           throw new Error("Failed to write QOA header.");
         }
 
-        const maybeChannels = wav.getSamples(false, Float32Array) as unknown as
-          | Float32Array
-          | Float32Array[];
+        const maybeChannels = wav.getSamples(false, Float32Array);
         const channelData = Array.isArray(maybeChannels) ? maybeChannels : [maybeChannels];
 
         let offset = 0;
         while (offset < length) {
           const frameSamples = Math.min(QOABase.MAX_FRAME_SAMPLES, length - offset);
-          const frameBuffer = new Int16Array(frameSamples * wavFmt.numChannels);
+          const frameBuffer = new Int16Array(frameSamples * wav.fmt.numChannels);
 
           let index = 0;
           for (let i = 0; i < frameSamples; i++) {
-            for (let c = 0; c < wavFmt.numChannels; c++) {
+            for (let c = 0; c < wav.fmt.numChannels; c++) {
               let sample = channelData[c][offset + i];
               sample = sample < -1 ? -1 : sample > 1 ? 1 : sample;
               frameBuffer[index++] = sample < 0 ? sample * 32768 : sample * 32767;
@@ -145,7 +134,7 @@ class qoaFuHandler implements FormatHandler {
         }
 
         const qoaBytes = encoder.getData();
-        const name = inputFile.name.split(".").slice(0, -1).join(".") + ".qoa";
+        const name = changeExt(inputFile.name, "qoa");
         outputFiles.push({ bytes: qoaBytes, name });
       }
     } else {

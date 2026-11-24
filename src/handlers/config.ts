@@ -12,62 +12,23 @@ import {
   stringifyTOML,
   stringifyINI,
 } from "confbox";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
-import {
-  FormatDefinition,
-  type FileData,
-  type FileFormat,
-  type FormatHandler,
-} from "../FormatHandler.ts";
-
-const JSON5_FORMAT = new FormatDefinition(
-  "JSON5",
-  "json5",
-  "json5",
-  "application/json5",
-  Category.DATA,
-);
-
-const JSONC_FORMAT = new FormatDefinition(
-  "JSON Comments",
-  "jsonc",
-  "jsonc",
-  "application/jsonc",
-  Category.DATA,
-);
-
-const TOML_FORMAT = new FormatDefinition(
-  "Tom's Obvious, Minimal Language",
-  "toml",
-  "toml",
-  "application/toml",
-  Category.DATA,
-);
-
-const INI_FORMAT = new FormatDefinition(
-  "Initialization file",
-  "ini",
-  "ini",
-  "text/plain",
-  Category.DATA,
-);
+import Formats from "src/Formats.ts";
+import { type FileData, type FileFormat, type FormatHandler } from "../FormatHandler.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 class configHandler implements FormatHandler {
-  public name: string = "config";
-  public ready: boolean = true;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
+  public readonly name = "config";
+  public supportedFormats = [
     // JSON maintains exact data equivalence to JS Objects natively
-    CommonFormats.JSON.builder("json").allowFrom().allowTo().markLossless(true),
+    Formats.JSON.builder("json").lossless().fromTo(),
     // JSON5, YAML, and TOML have comments and other features lost when parsed to JS Objects
-    JSON5_FORMAT.builder("json5").allowFrom().allowTo().markLossless(false),
-    JSONC_FORMAT.builder("jsonc").allowFrom().allowTo().markLossless(false),
-    CommonFormats.YML.builder("yaml").allowFrom().allowTo().markLossless(false),
-    CommonFormats.YML.builder("yaml").withExt("yaml").allowFrom().allowTo().markLossless(false),
-    TOML_FORMAT.builder("toml").allowFrom().allowTo().markLossless(false),
-    INI_FORMAT.builder("ini").allowFrom().allowTo().markLossless(false),
+    Formats.JSON5.builder("json5").fromTo(),
+    Formats.JSONC.builder("jsonc").fromTo(),
+    Formats.YML.builder("yaml").fromTo(),
+    Formats.TOML.builder("toml").fromTo(),
+    Formats.INI.builder("ini").fromTo(),
   ];
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -79,8 +40,7 @@ class configHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     return inputFiles.map((file) => {
-      const baseName = file.name.split(".").slice(0, -1).join(".");
-      const text = new TextDecoder().decode(file.bytes);
+      const text = decode(file.bytes);
 
       let object: any;
       switch (inputFormat.internal) {
@@ -118,7 +78,11 @@ class configHandler implements FormatHandler {
           outText = stringifyJSONC(object);
           break;
         case "yaml":
-          outText = stringifyYAML(object);
+          // confbox carries over a detected indent of 0 from compact input, which flattens nested YAML
+          outText = stringifyYAML(
+            object,
+            inputFormat.internal === "yaml" ? undefined : { indent: 2 },
+          );
           break;
         case "toml":
           outText = stringifyTOML(object);
@@ -131,8 +95,8 @@ class configHandler implements FormatHandler {
       }
 
       return {
-        name: `${baseName}.${outputFormat.extension}`,
-        bytes: new TextEncoder().encode(outText),
+        name: changeExt(file.name, outputFormat.extension),
+        bytes: encode(outText),
       };
     });
   }

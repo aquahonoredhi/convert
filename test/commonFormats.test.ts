@@ -1,7 +1,9 @@
 import { afterAll, expect, test } from "bun:test";
 import puppeteer from "puppeteer";
+import { preview } from "vite";
 import type { FileData, FormatHandler, FileFormat, ConvertPathNode } from "../src/FormatHandler.js";
-import CommonFormats from "../src/CommonFormats.js";
+import Formats from "../src/Formats.js";
+import type { HandlerName } from "../src/handlers/index.js";
 
 declare global {
   interface Window {
@@ -19,17 +21,26 @@ declare global {
   }
 }
 
-// Set up a basic webserver to host the distribution build
-const server = Bun.serve({
-  async fetch(req) {
-    let path = new URL(req.url).pathname.replace("/convert/", "") || "index.html";
-    path = path.replaceAll("..", "");
-    if (path.startsWith("/test/")) path = "../test/resources/" + path.slice(6);
-    const file = Bun.file(`${__dirname}/../dist/${path}`);
-    if (!(await file.exists())) return new Response("Not Found", { status: 404 });
-    return new Response(file);
-  },
-  port: 0,
+// Host the distribution build with vite's preview server (same headers as production),
+// plus the test resources under /test/
+const server = await preview({
+  logLevel: "silent",
+  preview: { port: 0 },
+  plugins: [
+    {
+      name: "test-resources",
+      configurePreviewServer(server) {
+        server.middlewares.use("/test", (req, res, next) => {
+          Bun.file(`${__dirname}/resources/${req.url!.replaceAll("..", "")}`)
+            .bytes()
+            .then(
+              (bytes) => res.end(bytes),
+              () => next(),
+            );
+        });
+      },
+    },
+  ],
 });
 
 // Start puppeteer, wait for ready confirmation
@@ -46,17 +57,18 @@ await Promise.all([
       if (text === "Built initial format list.") resolve(null);
     });
   }),
-  page.goto(`http://localhost:${server.port}/convert/index.html`),
+  page.goto(server.resolvedUrls!.local[0]),
 ]);
 
 console.log("Setup finished.");
 
 const dummyHandler: FormatHandler = {
-  name: "dummy",
+  // a handler that is never registered
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  name: "dummy" as HandlerName,
   ready: true,
-  offload: true,
   async init() {},
-  async doConvert(_inputFiles, inputFormat, outputFormat, _args) {
+  async doConvert(_inputFiles, inputFormat, outputFormat) {
     return [];
   },
 };
@@ -86,11 +98,7 @@ function attemptConversion(files: string[], from: FileFormat, to: FileFormat) {
 test(
   "png → jpeg",
   async () => {
-    const conversion = await attemptConversion(
-      ["colors_50x50.png"],
-      CommonFormats.PNG,
-      CommonFormats.JPEG,
-    );
+    const conversion = await attemptConversion(["colors_50x50.png"], Formats.PNG, Formats.JPEG);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual(["image/png", "image/jpeg"]);
@@ -101,11 +109,7 @@ test(
 test(
   "png → svg",
   async () => {
-    const conversion = await attemptConversion(
-      ["colors_50x50.png"],
-      CommonFormats.PNG,
-      CommonFormats.SVG,
-    );
+    const conversion = await attemptConversion(["colors_50x50.png"], Formats.PNG, Formats.SVG);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual(["image/png", "image/svg+xml"]);
@@ -116,11 +120,7 @@ test(
 test(
   "mp4 → apng",
   async () => {
-    const conversion = await attemptConversion(
-      ["doom.mp4"],
-      CommonFormats.MP4,
-      CommonFormats.PNG.builder("apng").withFormat("apng"),
-    );
+    const conversion = await attemptConversion(["doom.mp4"], Formats.MP4, Formats.APNG);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.format)).toEqual(["mp4", "apng"]);
@@ -132,11 +132,7 @@ test(
 test(
   "png → mp4",
   async () => {
-    const conversion = await attemptConversion(
-      ["colors_50x50.png"],
-      CommonFormats.PNG,
-      CommonFormats.MP4,
-    );
+    const conversion = await attemptConversion(["colors_50x50.png"], Formats.PNG, Formats.MP4);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual(["image/png", "video/mp4"]);
@@ -147,11 +143,7 @@ test(
 test(
   "png → wav → mp3",
   async () => {
-    const conversion = await attemptConversion(
-      ["colors_50x50.png"],
-      CommonFormats.PNG,
-      CommonFormats.MP3,
-    );
+    const conversion = await attemptConversion(["colors_50x50.png"], Formats.PNG, Formats.MP3);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual([
@@ -166,11 +158,7 @@ test(
 test(
   "mp3 → png → gif",
   async () => {
-    const conversion = await attemptConversion(
-      ["gaster.mp3"],
-      CommonFormats.MP3,
-      CommonFormats.GIF,
-    );
+    const conversion = await attemptConversion(["gaster.mp3"], Formats.MP3, Formats.GIF);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual([
@@ -186,11 +174,7 @@ test(
 test(
   "docx → typst → pdf",
   async () => {
-    const conversion = await attemptConversion(
-      ["word.docx"],
-      CommonFormats.DOCX,
-      CommonFormats.PDF,
-    );
+    const conversion = await attemptConversion(["word.docx"], Formats.DOCX, Formats.PDF);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual([
@@ -209,8 +193,8 @@ test(
   async () => {
     const conversion = await attemptConversion(
       ["chart-and-complex.pptx"],
-      CommonFormats.PPTX,
-      CommonFormats.PDF,
+      Formats.PPTX,
+      Formats.PDF,
     );
 
     expect(conversion).toBeTruthy();
@@ -225,11 +209,7 @@ test(
 test(
   "md → docx",
   async () => {
-    const conversion = await attemptConversion(
-      ["markdown.md"],
-      CommonFormats.MD,
-      CommonFormats.DOCX,
-    );
+    const conversion = await attemptConversion(["markdown.md"], Formats.MD, Formats.DOCX);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual([
@@ -243,11 +223,7 @@ test(
 test(
   "txt → wav → flac",
   async () => {
-    const conversion = await attemptConversion(
-      ["markdown.md"],
-      CommonFormats.TEXT,
-      CommonFormats.FLAC,
-    );
+    const conversion = await attemptConversion(["markdown.md"], Formats.TEXT, Formats.FLAC);
 
     expect(conversion).toBeTruthy();
     expect(conversion!.path.map((c) => c.format.mime)).toEqual([
@@ -266,5 +242,5 @@ test(
 
 afterAll(async () => {
   await browser.close();
-  server.stop();
+  await server.close();
 });

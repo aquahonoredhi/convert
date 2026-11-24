@@ -1,36 +1,16 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { Chess } from "chess.js";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 class chessjsHandler implements FormatHandler {
-  public name: string = "chessjs";
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "Forsyth–Edwards Notation",
-      format: "fen",
-      extension: "fen",
-      mime: "application/vnd.chess-fen",
-      from: true,
-      to: true,
-      internal: "fen",
-      category: Category.TEXT,
-      lossless: false,
-    },
-    {
-      name: "Portable Game Notation",
-      format: "pgn",
-      extension: "pgn",
-      mime: "application/vnd.chess-pgn",
-      from: true,
-      to: true,
-      internal: "pgn",
-      category: Category.TEXT,
-      lossless: true,
-    },
-    CommonFormats.TEXT.builder("txt").allowTo().markLossless(false),
+  public readonly name = "chessjs";
+  public supportedFormats = [
+    Formats.FEN.builder("fen").fromTo(),
+    Formats.PGN.builder("pgn").lossless().fromTo(),
+    Formats.TEXT.builder("txt").to(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -45,7 +25,7 @@ class chessjsHandler implements FormatHandler {
     for (const inputFile of inputFiles) {
       const chess = new Chess();
 
-      const input = new TextDecoder().decode(inputFile.bytes).trim();
+      const input = decode(inputFile.bytes).trim();
       if (inputFormat.internal === "fen") {
         chess.load(input, { skipValidation: true });
       } else if (inputFormat.internal === "pgn") {
@@ -65,8 +45,8 @@ class chessjsHandler implements FormatHandler {
         throw new TypeError(`chessjsHandler cannot convert to ${outputFormat.mime}`);
       }
 
-      const bytes = new TextEncoder().encode(output);
-      const name = inputFile.name.replace(/\.[^.]+$/, "") + `.${outputFormat.extension}`;
+      const bytes = encode(output);
+      const name = changeExt(inputFile.name, outputFormat.extension);
       outputFiles.push({ name, bytes });
     }
     return outputFiles;

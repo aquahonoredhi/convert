@@ -1,36 +1,22 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { InitializationError } from "src/errors.ts";
+import { canvasToBlob, createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 class xcursorHandler implements FormatHandler {
-  public name: string = "xcursor";
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PNG.builder("png").markLossless().allowFrom(false).allowTo(true),
-    CommonFormats.JPEG.builder("jpeg").allowFrom(false).allowTo(true),
-    {
-      name: "X11 cursor",
-      format: "xcur",
-      extension: "",
-      mime: "image/x-x11-cursor",
-      from: true,
-      to: false,
-      internal: "xcur",
-      category: Category.IMAGE,
-      lossless: true,
-    },
+  public readonly name = "xcursor";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().to(),
+    Formats.JPEG.builder("jpeg").to(),
+    Formats.XCUR.builder("xcur").lossless().from(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.#canvas = new OffscreenCanvas(1, 1);
-    const ctx = this.#canvas.getContext("2d");
-    if (!ctx) throw new InitializationError("Failed to create 2D rendering context.");
-    this.#ctx = ctx;
+    this.#bundle = createCanvas();
 
     this.ready = true;
   }
@@ -40,9 +26,10 @@ class xcursorHandler implements FormatHandler {
     inputFormat: FileFormat,
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
-    if (!this.ready || !this.#canvas || !this.#ctx) {
+    if (!this.ready || !this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { canvas, ctx } = this.#bundle;
     if (
       inputFormat.internal !== "xcur" ||
       outputFormat.internal === "xcur" ||
@@ -56,7 +43,11 @@ class xcursorHandler implements FormatHandler {
     const outputFiles: FileData[] = [];
 
     for (const inputFile of inputFiles) {
-      const view = new DataView(inputFile.bytes.buffer);
+      const view = new DataView(
+        inputFile.bytes.buffer,
+        inputFile.bytes.byteOffset,
+        inputFile.bytes.byteLength,
+      );
 
       const magic = Array.from(inputFile.bytes.slice(0, 4))
         .map((c) => String.fromCharCode(c))
@@ -82,19 +73,24 @@ class xcursorHandler implements FormatHandler {
         const _xHot = view.getUint32(offset + 24, true);
         const _yHot = view.getUint32(offset + 28, true);
 
-        const pixels = new Uint8ClampedArray(
-          inputFile.bytes.slice(offset + 36, offset + 36 + width * height * 4),
-        );
+        const source = inputFile.bytes.subarray(offset + 36, offset + 36 + width * height * 4);
+        const pixels = new Uint8ClampedArray(width * height * 4);
+        for (let p = 0; p + 3 < source.length; p += 4) {
+          const a = source[p + 3];
+          const unpremultiply = (c: number) => (a === 0 ? 0 : Math.round((c * 255) / a));
+          pixels[p] = unpremultiply(source[p + 2]);
+          pixels[p + 1] = unpremultiply(source[p + 1]);
+          pixels[p + 2] = unpremultiply(source[p]);
+          pixels[p + 3] = a;
+        }
 
-        this.#ctx.clearRect(0, 0, this.#canvas.width, this.#canvas.width);
-        this.#canvas.width = width;
-        this.#canvas.height = height;
+        canvas.width = width;
+        canvas.height = height;
 
-        const imageData = new ImageData(pixels as ImageDataArray, width, height);
-        this.#ctx.putImageData(imageData, 0, 0);
+        const imageData = new ImageData(pixels, width, height);
+        ctx.putImageData(imageData, 0, 0);
 
-        const blob = await this.#canvas.convertToBlob({ type: outputFormat.mime });
-        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const bytes = await canvasToBlob(this.#bundle, outputFormat.mime);
         const name = `${inputFile.name}_${i}.${outputFormat.extension}`;
         outputFiles.push({ bytes, name });
       }

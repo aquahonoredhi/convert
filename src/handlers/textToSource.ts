@@ -1,5 +1,6 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 function python(text: string): string {
   return `print(${JSON.stringify(text)})`;
@@ -9,8 +10,22 @@ function javascript(text: string): string {
   return `console.log(${JSON.stringify(text)});`;
 }
 
+/** C string literal with octal escapes for control characters. */
+function cString(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (ch === "\\" || ch === '"' || ch === "?") out += `\\${ch}`;
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\t") out += "\\t";
+    else if (code < 0x20 || code === 0x7f) out += `\\${code.toString(8).padStart(3, "0")}`;
+    else out += ch;
+  }
+  return `"${out}"`;
+}
+
 function c(text: string): string {
-  return `#include <stdio.h>\n\nint main() { printf("%s\\n", ${JSON.stringify(text)}); }`;
+  return `#include <stdio.h>\n\nint main() { printf("%s\\n", ${cString(text)}); }`;
 }
 
 function cpp(text: string): string {
@@ -18,21 +33,14 @@ function cpp(text: string): string {
 }
 
 function go(text: string): string {
-  text = text.replaceAll("`", '` + "`" + `');
-  return `package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println(\`${text}\`)\n}\n`;
+  return `package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println(${JSON.stringify(text)})\n}\n`;
 }
 
 function batch(text: string): string {
-  text = text
-    .replaceAll("^", "^^")
-    .replaceAll("%", "%%")
-    .replaceAll("&", "^&")
-    .replaceAll("|", "^|")
-    .replaceAll("<", "^<")
-    .replaceAll(">", "^>");
+  text = text.replaceAll("%", "%%").replaceAll(/[\^&|<>"]/g, "^$&");
   const lines = text.split(/\r?\n/);
-  const echos = lines.map((line) => (line.trim() === "" ? "echo.\r\n" : `echo ${line}\r\n`));
-  return `@echo off\r\n${echos.join("")}pause\r\n`;
+  const echos = lines.map((line) => `echo(${line}\r\n`);
+  return `@echo off\r\nchcp 65001 >nul\r\n${echos.join("")}pause\r\n`;
 }
 
 function shell(text: string): string {
@@ -49,115 +57,39 @@ function csharp(text: string): string {
 }
 
 function rust(text: string): string {
-  let count = 0;
-  while (text.includes(`"${"#".repeat(count)}`)) {
-    count++;
-  }
-  const hashtags = "#".repeat(count);
-  return `fn main() { println!("{}", r${hashtags}"${text}"${hashtags}); }`;
+  const escaped = Array.from(text, (ch) => {
+    const code = ch.codePointAt(0)!;
+    if (ch === "\\" || ch === '"') return `\\${ch}`;
+    if (ch === "\n") return "\\n";
+    if (ch === "\r") return "\\r";
+    if (ch === "\t") return "\\t";
+    if (code < 0x20 || code === 0x7f) return `\\u{${code.toString(16)}}`;
+    return ch;
+  }).join("");
+  return `fn main() { println!("{}", "${escaped}"); }`;
 }
 
 class textToSourceHandler implements FormatHandler {
   static converters: [FileFormat, (text: string) => string][] = [
-    [CommonFormats.PYTHON.builder("py").allowTo().markLossless(), python],
-    [
-      {
-        name: "Javascript Source File",
-        format: "js",
-        extension: "js",
-        mime: "text/javascript",
-        from: false,
-        to: true,
-        internal: "js",
-        category: Category.CODE,
-        lossless: true,
-      },
-      javascript,
-    ],
-    [
-      {
-        name: "C Source File",
-        format: "c",
-        extension: "c",
-        mime: "text/x-c",
-        from: false,
-        to: true,
-        internal: "c",
-        category: Category.CODE,
-        lossless: true,
-      },
-      c,
-    ],
-    [
-      {
-        name: "C++ Source File",
-        format: "cpp",
-        extension: "cpp",
-        mime: "text/x-c++src",
-        from: false,
-        to: true,
-        internal: "cpp",
-        category: Category.CODE,
-        lossless: true,
-      },
-      cpp,
-    ],
-    [
-      {
-        name: "Go Source File",
-        format: "go",
-        extension: "go",
-        mime: "text/x-go",
-        from: false,
-        to: true,
-        internal: "go",
-        category: Category.CODE,
-        lossless: true,
-      },
-      go,
-    ],
-    [CommonFormats.BATCH.builder("bat").allowTo().markLossless(), batch],
-    [CommonFormats.SH.builder("sh").allowTo().markLossless(), shell],
-    [
-      {
-        name: "C# Source File",
-        format: "cs",
-        extension: "cs",
-        mime: "text/csharp",
-        from: false,
-        to: true,
-        internal: "csharp",
-        category: Category.CODE,
-        lossless: true,
-      },
-      csharp,
-    ],
-    [
-      {
-        name: "Rust Source File",
-        format: "rs",
-        extension: "rs",
-        mime: "text/rust",
-        from: false,
-        to: true,
-        internal: "rs",
-        category: Category.CODE,
-        lossless: true,
-      },
-      rust,
-    ],
+    [Formats.PYTHON.builder("py").lossless().to(), python],
+    [Formats.JS.builder("js").lossless().to(), javascript],
+    [Formats.C.builder("c").lossless().to(), c],
+    [Formats.CPP.builder("cpp").lossless().to(), cpp],
+    [Formats.GO.builder("go").lossless().to(), go],
+    [Formats.BATCH.builder("bat").lossless().to(), batch],
+    [Formats.SH.builder("sh").lossless().to(), shell],
+    [Formats.CSHARP.builder("csharp").lossless().to(), csharp],
+    [Formats.RUST.builder("rs").lossless().to(), rust],
   ];
 
-  public name: string = "textToSource";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "textToSource";
+  public supportedFormats = [
+    Formats.TEXT.builder("txt").lossless().from(),
+    ...textToSourceHandler.converters.map(([format]) => format),
+  ];
+  public ready = false;
 
   async init() {
-    const formats = textToSourceHandler.converters.map(([format]) => format);
-    this.supportedFormats = [CommonFormats.TEXT.builder("txt").allowFrom().markLossless()];
-    this.supportedFormats.push(...formats);
-
     this.ready = true;
   }
 
@@ -178,12 +110,12 @@ class textToSourceHandler implements FormatHandler {
     const [, converter] = converterEntry;
 
     for (const inputFile of inputFiles) {
-      const text = new TextDecoder().decode(inputFile.bytes).replaceAll(/\r?\n/g, "\n");
+      const text = decode(inputFile.bytes).replaceAll(/\r?\n/g, "\n");
 
       const converted = converter(text);
 
-      const bytes = new TextEncoder().encode(converted);
-      const name = inputFile.name.replace(/\.txt$/i, `.${outputFormat.extension}`);
+      const bytes = encode(converted);
+      const name = changeExt(inputFile.name, outputFormat.extension);
       outputFiles.push({ bytes, name });
     }
     return outputFiles;

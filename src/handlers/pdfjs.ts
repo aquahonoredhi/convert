@@ -1,8 +1,11 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+import { changeExt } from "src/common/index.ts";
+import { resolveSize } from "src/common/canvas.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
 
 type CanvasAndContext = {
   canvas: OffscreenCanvas;
@@ -32,16 +35,14 @@ class WorkerCanvasFactory {
 }
 
 class pdfjsHandler implements FormatHandler {
-  public name: string = "pdfjs";
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PDF.builder("pdf").allowFrom(),
-    CommonFormats.PNG.supported("png", false, true),
-    CommonFormats.JPEG.supported("jpeg", false, true),
+  public readonly name = "pdfjs";
+  public supportedFormats = [
+    Formats.PDF.builder("pdf").from(),
+    Formats.PNG.builder("png").options({ width: true, height: true }).to(),
+    Formats.JPEG.builder("jpeg").options({ width: true, height: true }).to(),
   ];
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
+  public abortable = true;
 
   async init() {
     GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -52,6 +53,7 @@ class pdfjsHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
 
@@ -59,42 +61,38 @@ class pdfjsHandler implements FormatHandler {
       const loadingTask = getDocument({
         data: new Uint8Array(inputFile.bytes),
         CanvasFactory: WorkerCanvasFactory,
-        standardFontDataUrl: new URL(
-          `${import.meta.env.BASE_URL}js/pdfjs/standard_fonts/`,
-          globalThis.location.href,
-        ).href,
-        cMapUrl: new URL(`${import.meta.env.BASE_URL}js/pdfjs/cmaps/`, globalThis.location.href)
-          .href,
+        standardFontDataUrl: new URL("external/pdfjs/standard_fonts/", globalThis.baseUrl).href,
+        cMapUrl: new URL("external/pdfjs/cmaps/", globalThis.baseUrl).href,
         cMapPacked: true,
         useWorkerFetch: true,
-        wasmUrl: new URL(`${import.meta.env.BASE_URL}js/pdfjs/wasm/`, globalThis.location.href)
-          .href,
+        wasmUrl: new URL("external/pdfjs/wasm/", globalThis.baseUrl).href,
         disableFontFace: true,
         useSystemFonts: false,
       });
       try {
         const pdf = await loadingTask.promise;
-        const baseName = inputFile.name.split(".").slice(0, -1).join(".");
         const factory = new WorkerCanvasFactory();
 
         for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+          await ctx?.checkpoint();
           const page = await pdf.getPage(pageNumber);
           const viewport = page.getViewport({ scale: 1 });
-          const target = factory.create(viewport.width, viewport.height);
+          const { width, height } = resolveSize(viewport.width, viewport.height, ctx?.options);
+          const target = factory.create(width, height);
           try {
             await page.render({
               canvas: null,
               // PDF.js accepts an OffscreenCanvas context, but its types only list DOM contexts.
+              // oxlint-disable-next-line typescript/no-unsafe-type-assertion
               canvasContext: target.context as unknown as CanvasRenderingContext2D,
               viewport,
+              transform: [width / viewport.width, 0, 0, height / viewport.height, 0, 0],
               background: "rgb(255,255,255)",
             }).promise;
-            const blob = await target.canvas.convertToBlob({
-              type: outputFormat.mime,
-            });
+            const blob = await target.canvas.convertToBlob({ type: outputFormat.mime });
             outputFiles.push({
-              bytes: new Uint8Array(await blob.arrayBuffer()),
-              name: `${baseName}_${pageNumber - 1}.${outputFormat.extension}`,
+              bytes: await blob.bytes(),
+              name: changeExt(inputFile.name, outputFormat.extension, `_${pageNumber - 1}`),
             });
           } finally {
             factory.destroy(target);

@@ -1,22 +1,32 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import JSZip from "jszip";
-import pako from "pako";
-import { isMOBI, MOBI } from "./azw3/mobi.js";
+import * as pako from "pako";
+import { isMOBI, MOBI } from "built/foliate-mobi/mobi.js";
 import { DOMParser } from "linkedom/worker";
+import { changeExt, ownedBytes } from "src/common/index.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
+
+const XML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&apos;",
+};
+const escapeXml = (value: unknown) => String(value).replace(/[&<>"']/g, (c) => XML_ESCAPES[c]);
 
 class azw3Handler implements FormatHandler {
-  public name: string = "azw3";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "azw3";
+  public supportedFormats = [
+    Formats.AZW3.builder("azw3").from(),
+    Formats.MOBI.builder("mobi").from(),
+    Formats.EPUB.builder("epub").to(),
+  ];
+  public ready = false;
+  public abortable = true;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.AZW3.supported("azw3", true, false),
-      CommonFormats.MOBI.supported("mobi", true, false),
-      CommonFormats.EPUB.supported("epub", false, true),
-    ];
     this.ready = true;
   }
 
@@ -24,9 +34,11 @@ class azw3Handler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
     for (const inputFile of inputFiles) {
+      await ctx?.checkpoint();
       const blob = new Blob([new Uint8Array(inputFile.bytes)]);
       const valid = await isMOBI(blob);
       if (!valid) throw new Error("Invalid MOBI/AZW3 file.");
@@ -57,9 +69,10 @@ class azw3Handler implements FormatHandler {
       for (let i = 0; i < book.sections.length; i++) {
         const section = book.sections[i];
         const isLinear = section.linear !== "no";
+        await ctx?.checkpoint();
 
         try {
-          const doc = (await section.createDocument?.()) as Document | undefined;
+          const doc: Document | undefined = await section.createDocument?.();
           if (!doc) continue;
 
           // Images handling
@@ -71,29 +84,19 @@ class azw3Handler implements FormatHandler {
             if (recindex != null) {
               try {
                 const buf = await book.mobi.loadResource(Number(recindex) - 1);
-                const uint8 = new Uint8Array(buf as ArrayBuffer);
-                let binary = "";
-                for (let j = 0; j < uint8.byteLength; j++) {
-                  binary += String.fromCharCode(uint8[j]);
-                }
-                b64 = btoa(binary);
+                b64 = new Uint8Array(buf).toBase64();
               } catch (e) {
                 console.warn(e);
               }
             } else {
               const src = img.getAttribute("src");
-              if (src && src.startsWith("kindle:embed:")) {
+              // only KF8 (AZW3) books embed resources this way
+              if (src && src.startsWith("kindle:embed:") && "loadResourceBlob" in book) {
                 try {
-                  const [b] = await (book as any).loadResourceBlob(src);
-                  if (b) {
+                  const [b] = await book.loadResourceBlob(src);
+                  if (b instanceof Blob) {
                     type = b.type;
-                    const arrayBuffer = await b.arrayBuffer();
-                    const uint8 = new Uint8Array(arrayBuffer);
-                    let binary = "";
-                    for (let j = 0; j < uint8.byteLength; j++) {
-                      binary += String.fromCharCode(uint8[j]);
-                    }
-                    b64 = btoa(binary);
+                    b64 = (await b.bytes()).toBase64();
                   }
                 } catch (e) {
                   console.warn(e);
@@ -125,21 +128,23 @@ class azw3Handler implements FormatHandler {
         }
       }
 
+      const uid = metadata?.identifier || Date.now();
+
       // Create content.opf
       const opf = `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
     <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-        <dc:title>${metadata?.title || "Unknown Book"}</dc:title>
-        <dc:language>${metadata?.language || "en"}</dc:language>
-        <dc:identifier id="uid">${metadata?.identifier || Date.now()}</dc:identifier>
-        ${metadata?.author ? metadata.author.map((a: string) => `<dc:creator>${a}</dc:creator>`).join("") : ""}
+        <dc:title>${escapeXml(metadata?.title || "Unknown Book")}</dc:title>
+        <dc:language>${escapeXml(metadata?.language || "en")}</dc:language>
+        <dc:identifier id="uid">${escapeXml(uid)}</dc:identifier>
+        ${metadata?.author ? metadata.author.map((a: string) => `<dc:creator>${escapeXml(a)}</dc:creator>`).join("") : ""}
     </metadata>
     <manifest>
-        ${manifest.join("\\n        ")}
+        ${manifest.join("\n        ")}
         <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
     </manifest>
     <spine toc="ncx">
-        ${spine.join("\\n        ")}
+        ${spine.join("\n        ")}
     </spine>
 </package>`;
 
@@ -149,28 +154,28 @@ class azw3Handler implements FormatHandler {
       const ncx = `<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
     <head>
-        <meta name="dtb:uid" content="${metadata?.identifier || Date.now()}"/>
+        <meta name="dtb:uid" content="${escapeXml(uid)}"/>
         <meta name="dtb:depth" content="1"/>
         <meta name="dtb:totalPageCount" content="0"/>
         <meta name="dtb:maxPageNumber" content="0"/>
     </head>
     <docTitle>
-        <text>${metadata?.title || "Unknown Book"}</text>
+        <text>${escapeXml(metadata?.title || "Unknown Book")}</text>
     </docTitle>
     <navMap>
         <navPoint id="navPoint-1" playOrder="1">
             <navLabel><text>Start</text></navLabel>
-            <content src="part0.html"/>
+            <content src="part0.xhtml"/>
         </navPoint>
     </navMap>
 </ncx>`;
       oebps.file("toc.ncx", ncx);
 
       const epubBlob = await zip.generateAsync({ type: "uint8array" });
-      const outputName = inputFile.name.split(".").slice(0, -1).join(".") + ".epub";
+      const outputName = changeExt(inputFile.name, "epub");
       outputFiles.push({
         name: outputName,
-        bytes: epubBlob,
+        bytes: ownedBytes(epubBlob),
       });
     }
     return outputFiles;

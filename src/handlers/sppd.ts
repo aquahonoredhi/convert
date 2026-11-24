@@ -3,11 +3,14 @@ import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import * as THREE from "three";
 import * as CSG from "three-bvh-csg";
 
-import { Demo } from "./sppd/sppd/Demo.ts";
-import { Vector } from "./sppd/sppd/Vector.ts";
+import { Demo } from "built/sppd/sppd/Demo.ts";
+import { Vector } from "built/sppd/sppd/Vector.ts";
 
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { resolveSize } from "src/common/canvas.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
 
 function toThreeVector(vec: Vector) {
   return new THREE.Vector3(vec.y, vec.z, vec.x);
@@ -147,27 +150,9 @@ function getModelBuilder(modelName: string) {
       return createLaserEmitter;
     case "models/props/laser_emitter_center.mdl":
       return () => createLaserEmitter(true);
+    default:
+      return undefined;
   }
-}
-
-function getJsonReplacer() {
-  const ancestors: object[] = [];
-  return function (this: any, _key: string, value: any) {
-    if (typeof value === "bigint") {
-      return value.toString();
-    }
-    if (typeof value !== "object" || value === null) {
-      return value;
-    }
-    while (ancestors.length > 0 && ancestors.at(-1) !== this) {
-      ancestors.pop();
-    }
-    if (ancestors.includes(value)) {
-      return `[Circular reference to ${value.constructor.name}]`;
-    }
-    ancestors.push(value);
-    return value;
-  };
 }
 
 const VOXEL_SIZE = 128;
@@ -184,26 +169,13 @@ const wallMaterial = new THREE.MeshLambertMaterial({ color: 0x242424 });
 const wallPortalMaterial = new THREE.MeshLambertMaterial({ color: 0x505050 });
 
 class sppdHandler implements FormatHandler {
-  public name: string = "sppd";
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "Portal 2 Demo File",
-      format: "dem",
-      extension: "dem",
-      mime: "application/x-portal2-demo",
-      from: true,
-      to: false,
-      internal: "dem",
-      category: Category.DATA,
-      lossless: false,
-    },
-    CommonFormats.PNG.supported("png", false, true),
-    CommonFormats.JPEG.supported("jpeg", false, true),
-    CommonFormats.JSON.supported("json", false, true, true),
+  public readonly name = "sppd";
+  public supportedFormats = [
+    Formats.PORTAL2_DEM.builder("dem").from(),
+    Formats.PNG.builder("png").options({ width: true, height: true }).to(),
+    Formats.JPEG.builder("jpeg").options({ width: true, height: true }).to(),
   ];
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   private renderBounds = { width: 640, height: 360 };
 
@@ -484,6 +456,10 @@ class sppdHandler implements FormatHandler {
 
       // Mesh being drawn does not correspond to this entity
       if (object.entity !== entity) {
+        if (object.renderable) {
+          this.scene.remove(object.renderable);
+          object.renderable = null;
+        }
         const modelBuilder = getModelBuilder(model);
         if (modelBuilder) {
           if (classname === "phys_bone_follower") {
@@ -501,10 +477,6 @@ class sppdHandler implements FormatHandler {
           const offset = toThreeVector(center.Sub(pos));
           geometry.translate(offset.x, offset.y, offset.z);
           object.renderable = new THREE.Mesh(geometry, isBrush ? brushMaterial : propMaterial);
-
-          if (object.renderable) {
-            this.scene.remove(object.renderable);
-          }
           this.scene.add(object.renderable);
         }
       }
@@ -530,12 +502,22 @@ class sppdHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
 
-    if (!this.ready) throw new InitializationError("Handler not initialized.");
+    if (!this.ready || !this.renderer) throw new InitializationError("Handler not initialized.");
     if (inputFormat.format !== "dem")
       throw new TypeError(`Unsupported input format: ${inputFormat.internal}`);
+
+    const { width, height } = resolveSize(
+      this.renderBounds.width,
+      this.renderBounds.height,
+      ctx?.options,
+    );
+    this.renderer.setSize(width, height, false);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
 
     let frameIndex = 0;
 
@@ -543,26 +525,15 @@ class sppdHandler implements FormatHandler {
       const voxels: Map<string, Vector> = new Map();
       const portalVoxels: Map<string, Vector> = new Map();
 
-      if (outputFormat.format !== "json") {
-        this.resetSceneWalls();
-        this.voxelGridOffset = null;
-      }
+      this.resetSceneWalls();
+      this.voxelGridOffset = null;
 
-      const demo: Demo = await new Promise((resolve) => {
+      await new Promise((resolve) => {
         new Demo(inputFile.bytes, {
           onTick: (demo) => this.collectPoints(demo, voxels, portalVoxels),
           onFinish: resolve,
         });
       });
-
-      if (outputFormat.format === "json") {
-        const encoder = new TextEncoder();
-        const string = JSON.stringify(demo, getJsonReplacer(), 2);
-        const bytes = encoder.encode(string);
-        const name = inputFile.name.split(".").slice(0, -1).join(".") + ".json";
-        outputFiles.push({ bytes, name });
-        continue;
-      }
 
       const canvas = this.canvas;
       const renderer = this.renderer;
@@ -578,13 +549,8 @@ class sppdHandler implements FormatHandler {
             renderer.render(this.scene, this.camera);
 
             const rendered = await canvas.convertToBlob({ type: outputFormat.mime });
-            const bytes = new Uint8Array(await rendered.arrayBuffer());
-            const name =
-              inputFile.name.split(".").slice(0, -1).join(".") +
-              "_" +
-              frameIndex +
-              "." +
-              outputFormat.extension;
+            const bytes = await rendered.bytes();
+            const name = changeExt(inputFile.name, outputFormat.extension, `_${frameIndex}`);
             outputFiles.push({ bytes, name });
 
             frameIndex++;

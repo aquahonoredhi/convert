@@ -1,7 +1,19 @@
 import { Vector3, Quaternion } from "three";
+import { decode } from "src/common/index.ts";
 
 // See BSOR specification for more info:
 // https://github.com/BeatLeader/BS-Open-Replay
+
+/** Returns the member of a numeric enum with this value, if there is one. */
+function enumMember<T extends number>(
+  members: Record<string, T | string>,
+  value: number,
+): T | undefined {
+  for (const member of Object.values(members)) {
+    if (typeof member === "number" && member === value) return member;
+  }
+  return undefined;
+}
 
 export interface Frame {
   time: number;
@@ -29,6 +41,9 @@ export enum ScoringType {
   SLIDER_TAIL,
   BURST_SLIDER_HEAD,
   BURST_SLIDER_ELEMENT,
+  ARC_HEAD_ARC_TAIL,
+  CHAIN_HEAD_ARC_TAIL,
+  CHAIN_LINK_ARC_HEAD,
 }
 
 export enum Saber {
@@ -44,6 +59,8 @@ export enum CutType {
 }
 
 export enum NoteColor {
+  /** Bombs */
+  NONE = -1,
   LEFT = 0,
   RIGHT = 1,
 }
@@ -200,6 +217,14 @@ export class Replay {
       throw new BSORError(msg);
     }
 
+    function member<T extends number>(
+      members: Record<string, T | string>,
+      value: number,
+      what: string,
+    ): T {
+      return enumMember(members, value) ?? raise(`Unknown ${what} ${value}`);
+    }
+
     function get(n: number): number {
       return data[n] ?? raise("Unexpected EOF");
     }
@@ -224,7 +249,7 @@ export class Replay {
       bufferU8[1] = byte();
       bufferU8[2] = byte();
       bufferU8[3] = byte();
-      return bufferF32[0]!;
+      return bufferF32[0];
     }
 
     function bool(): boolean {
@@ -234,7 +259,8 @@ export class Replay {
     function string(): string {
       const length = int();
       pos += length;
-      return new TextDecoder().decode(new Uint8Array(data.buffer, pos - length, length));
+      if (length < 0 || pos > data.length) raise("Unexpected EOF");
+      return decode(data.subarray(pos - length, pos));
     }
     function vector(): Vector3 {
       return new Vector3(float(), float(), float());
@@ -306,15 +332,21 @@ export class Replay {
     this.notes = [];
     const noteCount = int();
     for (let i = 0; i < noteCount; i++) {
-      const id = int();
-      const scoringType = Math.floor(id / 10000);
+      let id = int();
+      let colorDigit = Math.floor(id / 10) % 10;
+      if (colorDigit === 9) {
+        id += 10;
+        colorDigit = -1;
+      }
+      const scoringType = enumMember(ScoringType, Math.floor(id / 10000)) ?? ScoringType.NORMAL;
       const lineIndex = Math.floor(id / 1000) % 10;
       const lineLayer = Math.floor(id / 100) % 10;
-      const color = (Math.floor(id / 10) % 10) as NoteColor;
-      const cutDirection = (id % 10) as CutDirection;
+      const color = enumMember(NoteColor, colorDigit) ?? NoteColor.NONE;
+      const cutDirection = enumMember(CutDirection, id % 10) ?? CutDirection.NONE;
       const time = float();
       const spawnTime = float();
-      const type = int() as CutType;
+      // unknown cut types are skipped below
+      const type = enumMember(CutType, int());
       switch (type) {
         case CutType.MISS:
         case CutType.BOMB:
@@ -350,7 +382,7 @@ export class Replay {
               saber: {
                 speed: float(),
                 dir: vector(),
-                type: int() as Saber,
+                type: member(Saber, int(), "saber"),
               },
               cut: {
                 timeDeviation: float(),
@@ -374,7 +406,7 @@ export class Replay {
       const id = int();
       this.walls.push({
         lineIndex: Math.floor(id / 100),
-        type: (Math.floor(id / 10) % 10) as ObstacleType,
+        type: enumMember(ObstacleType, Math.floor(id / 10) % 10) ?? ObstacleType.FullHeight,
         width: id % 10,
         energy: float(),
         time: float(),

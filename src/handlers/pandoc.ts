@@ -1,6 +1,6 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import type { ConvertContext } from "../ui/ProgressStore.js";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats, { Category, type CategoryType } from "src/Formats.ts";
 import mime from "mime";
 import normalizeMimeType from "../normalizeMimeType.ts";
 import { InitializationError } from "src/errors.ts";
@@ -12,6 +12,15 @@ import {
   postprocessTypstFromPandoc,
   preprocessHtmlForTypst,
 } from "./typst.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
+
+// outputs whose pandoc template can include a table of contents
+// oxfmt-ignore
+const TOC_FORMATS = new Set([
+  "html", "html4", "html5", "docx", "odt", "opendocument", "epub", "epub2", "epub3", "latex",
+  "context", "markdown", "gfm", "rst", "asciidoc", "org", "typst", "ms", "texinfo",
+]);
+const TOC_OPTION = { type: "boolean", label: "Table of contents" } as const;
 
 class pandocHandler implements FormatHandler {
   static formatNames: Map<string, string> = new Map([
@@ -30,11 +39,11 @@ class pandocHandler implements FormatHandler {
     ["context", "ConTeXt"],
     ["creole", "Creole 1.0"],
     ["csljson", "CSL JSON bibliography"],
-    ["csv", CommonFormats.CSV.name],
+    ["csv", Formats.CSV.name],
     ["djot", "Djot markup"],
     ["docbook", "DocBook v4"],
     ["docbook5", "DocBook v5"],
-    ["docx", CommonFormats.DOCX.name],
+    ["docx", Formats.DOCX.name],
     ["dokuwiki", "DokuWiki markup"],
     ["dzslides", "DZSlides HTML slides"],
     ["endnotexml", "EndNote XML bibliography"],
@@ -44,14 +53,14 @@ class pandocHandler implements FormatHandler {
     ["fb2", "FictionBook2"],
     ["gfm", "GitHub-Flavored Markdown"],
     ["haddock", "Haddock markup"],
-    ["html", CommonFormats.HTML.name],
+    ["html", Formats.HTML.name],
     ["html4", "XHTML 1.0 Transitional"],
-    ["html5", CommonFormats.HTML.name],
+    ["html5", Formats.HTML.name],
     ["icml", "InDesign ICML"],
     ["ipynb", "Jupyter notebook"],
     ["jats", "JATS XML"],
     ["jira", "Jira/Confluence wiki markup"],
-    ["json", CommonFormats.JSON.name],
+    ["json", Formats.JSON.name],
     ["latex", "LaTeX"],
     ["man", "roff man"],
     ["markdown", "Pandoc's Markdown"],
@@ -69,10 +78,10 @@ class pandocHandler implements FormatHandler {
     ["opendocument", "OpenDocument XML"],
     ["opml", "OPML"],
     ["org", "Emacs Org mode"],
-    ["pdf", CommonFormats.PDF.name],
-    ["text", CommonFormats.TEXT.name],
+    ["pdf", Formats.PDF.name],
+    ["text", Formats.TEXT.name],
     ["pod", "Perl POD"],
-    ["pptx", CommonFormats.PPTX.name],
+    ["pptx", Formats.PPTX.name],
     ["revealjs", "reveal.js HTML slides"],
     ["ris", "RIS bibliography"],
     ["rst", "reStructuredText"],
@@ -90,8 +99,8 @@ class pandocHandler implements FormatHandler {
     ["typst", "Typst"],
     ["vimdoc", "Vimdoc"],
     ["vimwiki", "Vimwiki"],
-    ["xlsx", CommonFormats.XLSX.name],
-    ["xml", CommonFormats.XML.name],
+    ["xlsx", Formats.XLSX.name],
+    ["xml", Formats.XML.name],
     ["xwiki", "XWiki markup"],
     ["zimwiki", "ZimWiki markup"],
     ["mathml", "Mathematical Markup Language"],
@@ -158,10 +167,9 @@ class pandocHandler implements FormatHandler {
     ["mathml", "mml"],
   ]);
 
-  public name: string = "pandoc";
+  public readonly name = "pandoc";
   public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   private query?: (options: any) => Promise<any>;
   private convert?: (
@@ -175,7 +183,7 @@ class pandocHandler implements FormatHandler {
   }>;
 
   async init() {
-    const { query, convert } = await import("./pandoc/pandoc.js");
+    const { query, convert } = await import("built/pandoc-js/pandoc.js");
     this.query = query;
     this.convert = convert;
 
@@ -195,18 +203,20 @@ class pandocHandler implements FormatHandler {
       if (format === "revealjs") continue;
       // Typst compilation is handled by the dedicated Typst handler.
       if (format === "pdf") continue;
+      // Pandoc's own AST serializations are waterfalls (see docs/design/WATERFALLS.md)
+      if (format === "json" || format === "xml" || format === "native") continue;
       // Adjust plaintext format name to match other handlers
       if (format === "plain") format = "text";
       const name = pandocHandler.formatNames.get(format) || format;
       const extension = pandocHandler.formatExtensions.get(format) || format;
       const mimeType = normalizeMimeType(mime.getType(extension) || `text/${format}`);
-      const categories: string[] = [];
-      if (format === "xlsx") categories.push("spreadsheet");
-      else if (format === "pptx") categories.push("presentation");
+      const categories: CategoryType[] = [];
+      if (format === "xlsx") categories.push(Category.SPREADSHEET);
+      else if (format === "pptx") categories.push(Category.PRESENTATION);
       if (name.toLowerCase().includes("text") || mimeType === "text/plain") {
-        categories.push("text");
+        categories.push(Category.TEXT);
       } else {
-        categories.push("document");
+        categories.push(Category.DOCUMENT);
       }
       const isOfficeDocument =
         format === "docx" ||
@@ -226,21 +236,23 @@ class pandocHandler implements FormatHandler {
         internal,
         category: categories.length === 1 ? categories[0] : categories,
         lossless: !isOfficeDocument,
+        options: TOC_FORMATS.has(internal) ? { toc: TOC_OPTION } : undefined,
       });
     }
 
     // Move HTML up, it's the only format that can embed resources
     const htmlIndex = this.supportedFormats.findIndex((c) => c.internal === "html");
-    const htmlFormat = this.supportedFormats[htmlIndex];
-    this.supportedFormats.splice(htmlIndex, 1);
-    this.supportedFormats.unshift(htmlFormat);
+    if (htmlIndex !== -1) {
+      const htmlFormat = this.supportedFormats[htmlIndex];
+      this.supportedFormats.splice(htmlIndex, 1);
+      this.supportedFormats.unshift(htmlFormat);
+    }
     const typstIndex = this.supportedFormats.findIndex((c) => c.internal === "typst");
     if (typstIndex !== -1) {
       const typstFormat = this.supportedFormats[typstIndex];
       this.supportedFormats.splice(typstIndex, 1);
       this.supportedFormats.splice(1, 0, typstFormat);
     }
-    // pandoc internal formats is almost always never what the user wants
     const jsonXmlFormats = this.supportedFormats.filter(
       (c) => c.mime === "application/json" || c.mime === "application/xml",
     );
@@ -256,7 +268,6 @@ class pandocHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    args?: string[],
     ctx?: ConvertContext,
   ): Promise<FileData[]> {
     if (!this.ready || !this.query || !this.convert)
@@ -273,12 +284,10 @@ class pandocHandler implements FormatHandler {
         inputFormat.internal === "html" &&
         (outputFormat.internal === "pdf" || outputFormat.internal === "typst");
       const sourceBytes = shouldNormalizeHtmlForTypst
-        ? new TextEncoder().encode(
-            preprocessHtmlForTypst(new TextDecoder().decode(inputFile.bytes)),
-          )
+        ? encode(preprocessHtmlForTypst(decode(inputFile.bytes)))
         : inputFile.bytes;
       const files: Record<string, any> = {
-        [vfsInputName]: new Blob([sourceBytes as BlobPart]),
+        [vfsInputName]: new Blob([sourceBytes]),
       };
 
       const progressMsg = `Converting ${inputFile.name}...`;
@@ -297,6 +306,12 @@ class pandocHandler implements FormatHandler {
       if (outputFormat.internal === "mathml") {
         options.to = "html";
         options["html-math-method"] = "mathml";
+      }
+
+      if (ctx?.options.toc) {
+        options["table-of-contents"] = true;
+        // the toc is part of the document template, so it needs a full document
+        options.standalone = true;
       }
 
       if (outputFormat.internal === "typst") {
@@ -323,17 +338,16 @@ class pandocHandler implements FormatHandler {
         continue;
       }
 
-      const arrayBuffer = await outputBlob.arrayBuffer();
-      let bytes = new Uint8Array(arrayBuffer);
+      let bytes = await outputBlob.bytes();
       if (outputFormat.internal === "typst") {
         const normalizedTypst = normalizeTypstAssetPaths(
-          postprocessTypstFromPandoc(new TextDecoder().decode(bytes)),
+          postprocessTypstFromPandoc(decode(bytes)),
           await collectTypstAssetFiles(files, [vfsInputName]),
         );
         const bundledTypst = await bundleTypstAssets(normalizedTypst, files, [vfsInputName]);
-        bytes = new TextEncoder().encode(bundledTypst);
+        bytes = encode(bundledTypst);
       }
-      const name = inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+      const name = changeExt(inputFile.name, outputFormat.extension);
 
       outputFiles.push({ bytes, name });
       i++;

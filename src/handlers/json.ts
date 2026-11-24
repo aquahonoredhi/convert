@@ -1,20 +1,28 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import parseXML from "./envelope/parseXML.js";
+import parseXML from "built/envelope/parseXML.js";
 import * as yaml from "yaml";
+import { parse, unparse } from "papaparse";
+import { changeExt, decode, encode } from "src/common/index.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
+import { numberOption } from "src/Settings.ts";
+
+const INDENT = { type: "number", label: "Indent", unit: "spaces", max: 8, integer: true } as const;
 
 /// Converts things to JSON
 export class toJsonHandler implements FormatHandler {
-  public name: string = "toJson";
-  public ready: boolean = true;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.CSV.builder("csv").allowFrom(),
-    CommonFormats.XML.builder("xml").allowFrom(),
-    CommonFormats.YML.builder("yaml").allowFrom(),
-    CommonFormats.JSON.supported("json", false, true, true),
+  public readonly name = "toJson";
+  public supportedFormats = [
+    Formats.CSV.builder("csv").from(),
+    Formats.XML.builder("xml").from(),
+    Formats.YML.builder("yaml").from(),
+    Formats.JSONL.builder("jsonl").from(),
+    Formats.JSON.builder("json")
+      .lossless()
+      .options({ indent: { ...INDENT, min: 0 } })
+      .to(),
   ];
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -24,46 +32,37 @@ export class toJsonHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     return inputFiles.map((file) => {
-      const name = file.name.split(".").slice(0, -1).join(".") + ".json";
-      const text = new TextDecoder().decode(file.bytes);
+      const name = changeExt(file.name, "json");
+      const text = decode(file.bytes).trim();
       let object: any;
       switch (inputFormat.mime) {
-        case "text/csv": {
-          const data = text.split(/\r?\n/).map((x) => {
-            const arr = [...x.matchAll(/(?:(?:"(?:[^"]|"")*")|[^,]*)(?:,|$)/g)].map(([x]) => {
-              if (x.endsWith(",")) x = x.substring(0, x.length - 1);
-              if (x.endsWith('"')) x = x.substring(1, x.length - 1);
-              return x;
-            });
-            arr.pop(); // remove empty final match that exists for some reason (I'm not good at regex)
-            return arr;
-          });
-          data.pop(); // remove empty end entry
-          const keys = data.shift() ?? [];
-          object = [];
-          for (const entry of data) {
-            let jsonEntry: any = {};
-            for (let i = 0; i < entry.length; i++) {
-              jsonEntry[i < keys.length ? keys[i] : `column${i + 1}`] = entry[i];
-            }
-            object.push(jsonEntry);
-          }
+        case "text/csv":
+          ({ data: object } = parse(text, {
+            header: true,
+            skipEmptyLines: true,
+          }));
           break;
-        }
         case "application/xml":
           object = parseXML(text);
           break;
         case "application/yaml":
           object = yaml.parse(text);
           break;
+        case "application/jsonl":
+          object = text
+            .split("\n")
+            .filter((l) => l.trim())
+            .map((l) => JSON.parse(l));
+          break;
         default:
           throw new Error("Unreachable");
       }
       return {
         name: name,
-        bytes: new TextEncoder().encode(JSON.stringify(object)),
+        bytes: encode(JSON.stringify(object, null, numberOption(ctx?.options, "indent"))),
       };
     });
   }
@@ -71,29 +70,33 @@ export class toJsonHandler implements FormatHandler {
 
 function xmlEscape(str: string): string {
   return str
+    .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;")
-    .replaceAll("&", "&amp;");
+    .replaceAll("'", "&apos;");
 }
 
-function csvEscape(str: string): string {
-  if (str.includes(",") || str.includes('"')) return `"${str.replaceAll('"', '""')}"`;
-  return str;
+const XML_NAME = /^[\p{L}_][\p{L}\p{N}_.-]*$/u;
+
+/** Open and close tags for `name`, falling back to `<Item key="name">` when it is no valid XML name. */
+function xmlTags(name: string): [string, string] {
+  if (XML_NAME.test(name)) return [`<${name}>`, `</${name}>`];
+  return [`<Item key="${xmlEscape(name)}">`, "</Item>"];
 }
 
 /// Converts to things from JSON
 export class fromJsonHandler {
-  public name: string = "fromJson";
-  public ready: boolean = true;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.CSV.builder("csv").allowTo(),
-    CommonFormats.XML.builder("xml").allowTo(),
-    CommonFormats.YML.builder("yaml").allowTo(),
-    CommonFormats.JSON.supported("json", true, false),
+  public readonly name = "fromJson";
+  public ready = false;
+  public supportedFormats = [
+    Formats.CSV.builder("csv").to(),
+    Formats.XML.builder("xml").to(),
+    Formats.YML.builder("yaml")
+      .options({ indent: { ...INDENT, min: 1 } })
+      .to(),
+    Formats.JSONL.builder("jsonl").to(),
+    Formats.JSON.builder("json").from(),
   ];
 
   async init() {
@@ -104,74 +107,62 @@ export class fromJsonHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     return inputFiles.map((file) => {
-      const name = file.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
-      let object = JSON.parse(new TextDecoder().decode(file.bytes));
+      const name = changeExt(file.name, outputFormat.extension);
+      let object = JSON.parse(decode(file.bytes));
       let text = "";
       switch (outputFormat.mime) {
         case "text/csv": {
-          let keys: string[] = [];
+          // hell
+          if (!Array.isArray(object) && object && typeof object === "object") {
+            object = Object.entries(object).map(([key, value]) => ({
+              _key: key,
+              ...(value && typeof value === "object" && !Array.isArray(value)
+                ? value
+                : { _value: value }),
+            }));
+          }
           if (!Array.isArray(object)) {
-            // turn into array
-            let newObject: any = [];
-            for (const [k, v] of Object.entries(object)) {
-              if (v != null && typeof v === "object" && !Array.isArray(v)) {
-                (v as any)._key = k;
-                newObject.push(v);
-              } else {
-                newObject.push({ _key: k, _value: v });
+            object = [object];
+          }
+          object = object
+            .map((r: any) => (r && typeof r === "object" ? r : { _value: r }))
+            .map((r: any) => {
+              for (const [key, value] of Object.entries(r)) {
+                r[key] = value && typeof value === "object" ? JSON.stringify(value) : value;
               }
-            }
-            object = newObject;
-          }
-          const keySet = new Set<string>();
-          for (const value of object) {
-            if (typeof value !== "object" || Array.isArray(value)) {
-              keySet.add("_value");
-              continue;
-            }
-            for (const key of Object.keys(value)) {
-              if (!keySet.has(key)) keySet.add(key);
-            }
-          }
-          keys = [...keySet].toSorted();
-          text += keys.map((x) => csvEscape(x)).join(",") + "\n";
-          for (const value of object) {
-            text +=
-              keys
-                .map((key) => {
-                  if (key === "_value" && (typeof value !== "object" || Array.isArray(value)))
-                    return value;
-                  return value[key] ?? "";
-                })
-                .map((x) => csvEscape(typeof x === "string" ? x : JSON.stringify(x)))
-                .join(",") + "\n";
-          }
+              return r;
+            });
+          const columns = [...new Set<string>(object.flatMap((r: object) => Object.keys(r)))];
+          if (columns.length) text = unparse(object, { columns: columns, header: true });
+          else text = "";
           break;
         }
         case "application/xml": {
           function write(value: any, tagName: string | null = null) {
-            if (tagName != null) tagName = xmlEscape(tagName);
-            if (typeof value !== "object") {
+            if (value === null || typeof value !== "object") {
               const str = xmlEscape(typeof value === "string" ? value : JSON.stringify(value));
-              if (tagName != null) text += `<${tagName}>${str}</${tagName}>`;
-              else text += str;
+              if (tagName != null) {
+                const [open, close] = xmlTags(tagName);
+                text += `${open}${str}${close}`;
+              } else text += str;
               return;
             }
             if (Array.isArray(value)) {
-              tagName ??= "Array";
-              text += `<${tagName}>`;
+              const [open, close] = xmlTags(tagName ?? "Array");
+              text += open;
               for (const item of value) {
                 write(item, "Item");
               }
-              text += `</${tagName}>`;
+              text += close;
               return;
             }
             const isXMLTag = typeof value._tag === "string" && Array.isArray(value._children); // is serialized XML tag
             if (isXMLTag) tagName ??= value._tag;
-            tagName ??= "Object";
-            text += `<${tagName}>`;
+            const [open, close] = xmlTags(tagName ?? "Object");
+            text += open;
             for (const [k, v] of Object.entries(value)) {
               if (isXMLTag && (k === "_tag" || k === "_children")) continue;
               write(v, k);
@@ -181,20 +172,28 @@ export class fromJsonHandler {
                 write(child);
               }
             }
-            text += `</${tagName}>`;
+            text += close;
           }
           write(object);
           break;
         }
-        case "application/yaml":
-          text = yaml.stringify(object);
+        case "application/yaml": {
+          const indent = numberOption(ctx?.options, "indent");
+          // yaml rejects an explicit `indent: undefined`
+          text = yaml.stringify(object, indent === undefined ? undefined : { indent });
+          break;
+        }
+        case "application/jsonl":
+          if (Array.isArray(object))
+            text = object.map((r: any) => JSON.stringify(r)).join("\n") + "\n";
+          else text = JSON.stringify(object);
           break;
         default:
           throw new Error("Unreachable");
       }
       return {
         name: name,
-        bytes: new TextEncoder().encode(text),
+        bytes: encode(text),
       };
     });
   }

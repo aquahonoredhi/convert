@@ -1,11 +1,22 @@
-import CommonFormats from "../CommonFormats.ts";
+import Formats from "../Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import type { ConvertContext } from "../ui/ProgressStore.ts";
 import ePub from "epubjs";
-import { DOMParser as WorkerDOMParser } from "linkedom/worker";
-import { XMLSerializer } from "@xmldom/xmldom";
+import { WorkerDOMParser } from "src/common/dom.ts";
+import { XMLSerializer, type Node as XmlNode } from "@xmldom/xmldom";
+import { encode, stripExt } from "src/common/index.ts";
+import type Section from "epubjs/types/section";
 
-const DOMParser = WorkerDOMParser as unknown as typeof globalThis.DOMParser;
+const DOMParser = WorkerDOMParser;
+
+const HTML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
 
 function blobUrlRegex() {
   return /url\(\s*(['"]?)(blob:[^'")\s]+)\1\s*\)/gu;
@@ -14,7 +25,11 @@ function blobUrlRegex() {
 async function blobToDataUrl(blob: Blob): Promise<string> {
   return await new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.addEventListener("loadend", () => resolve(reader.result as string));
+    reader.addEventListener("loadend", () =>
+      typeof reader.result === "string"
+        ? resolve(reader.result)
+        : reject(new Error("Could not read the blob as a data URL.")),
+    );
     reader.addEventListener("error", reject);
     reader.readAsDataURL(blob);
   });
@@ -112,14 +127,13 @@ async function inlineBlobBackedAttributes(printDoc: Document, cache: Map<string,
 }
 
 export default class epubHandler implements FormatHandler {
-  public name: string = "epub";
-  public ready: boolean = false;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.EPUB.supported("epub", true, false),
-    CommonFormats.HTML.supported("html", false, true),
+  public readonly name = "epub";
+  public supportedFormats = [
+    Formats.EPUB.builder("epub").from(),
+    Formats.HTML.builder("html").to(),
   ];
+  public ready = false;
+  public abortable = true;
 
   async init() {
     this.ready = true;
@@ -129,7 +143,6 @@ export default class epubHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    _args?: string[],
     ctx?: ConvertContext,
   ): Promise<FileData[]> {
     if (!this.ready) throw new Error("Handler not initialized.");
@@ -138,7 +151,8 @@ export default class epubHandler implements FormatHandler {
     const blobUrlCache = new Map<string, Promise<string>>();
 
     for (const file of inputFiles) {
-      const baseName = file.name.replace(/\.[^.]+$/u, "");
+      await ctx?.checkpoint();
+      const baseName = stripExt(file.name);
 
       if (outputFormat.internal === "html") {
         // Extract buffer
@@ -148,7 +162,7 @@ export default class epubHandler implements FormatHandler {
         );
 
         ctx?.log(`Parsing EPUB buffer (${file.bytes.byteLength} bytes)...`);
-        const currentBook = ePub(arrayBuffer as ArrayBuffer);
+        const currentBook = ePub(arrayBuffer);
         await currentBook.opened;
         ctx?.log(`EPUB ready. Formatting container...`);
 
@@ -158,7 +172,7 @@ export default class epubHandler implements FormatHandler {
           <html>
             <head>
               <meta charset="utf-8">
-              <title>${(currentBook as any).package?.metadata?.title || baseName}</title>
+              <title>${escapeHtml(currentBook.packaging?.metadata?.title || baseName)}</title>
               <style>
                 body {
                   font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, serif;
@@ -200,7 +214,8 @@ export default class epubHandler implements FormatHandler {
         const head = printDoc.head;
         const injectedStyles = new Set<string>();
 
-        const spineItems = (currentBook.spine as any).spineItems || [];
+        const spineItems: Section[] = [];
+        currentBook.spine.each((item: Section) => spineItems.push(item));
         const totalSpineItems = spineItems.length;
 
         if (totalSpineItems === 0) {
@@ -218,19 +233,22 @@ export default class epubHandler implements FormatHandler {
 
         const processWorker = async () => {
           while (true) {
+            if (await ctx?.aborted()) break;
             const index = currentIndex++;
             if (index >= totalSpineItems) break;
 
             ctx?.log(`Rendering chapter ${index + 1}/${totalSpineItems}...`);
 
-            const item = (currentBook.spine as any).get
-              ? (currentBook.spine as any).get(index)
-              : spineItems[index];
+            const item = spineItems[index];
 
             try {
+              // epubjs's typings say load returns the Document, it really returns a promise of it
+              // oxlint-disable-next-line typescript/await-thenable
               await item.load(currentBook.load.bind(currentBook));
               const html = currentBook.resources.substitute(
-                new XMLSerializer().serializeToString(item.document),
+                // epubjs types its documents as DOM ones, xmldom's serializer only walks the nodes
+                // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+                new XMLSerializer().serializeToString(item.document as unknown as XmlNode),
                 item.url,
               );
               const sectionDoc = new DOMParser().parseFromString(html, "text/html");
@@ -241,7 +259,10 @@ export default class epubHandler implements FormatHandler {
 
               results[index] = { headStyles, bodyHTML };
             } catch (e) {
-              ctx?.log(`Failed to render chapter ${index + 1}: ${e}`, "error");
+              ctx?.log(
+                `Failed to render chapter ${index + 1}: ${e instanceof Error ? e.message : String(e)}`,
+                "error",
+              );
             }
           }
         };
@@ -250,6 +271,10 @@ export default class epubHandler implements FormatHandler {
           processWorker(),
         );
         await Promise.all(workers);
+        if (await ctx?.aborted()) {
+          currentBook.destroy();
+          await ctx?.checkpoint();
+        }
 
         for (let i = 0; i < totalSpineItems; i++) {
           const res = results[i];
@@ -279,7 +304,7 @@ export default class epubHandler implements FormatHandler {
         const cssLinks = Array.from(printDoc.querySelectorAll('link[rel="stylesheet"]'));
         ctx?.log(`Chapters concatenated. Resolving ${cssLinks.length} dynamic stylesheets...`);
         const cssFetchPromises = cssLinks.map(async (link) => {
-          const href = (link as HTMLLinkElement).href;
+          const href = link.getAttribute("href") ?? "";
           if (href.startsWith("blob:")) {
             try {
               const response = await fetch(href);
@@ -288,7 +313,10 @@ export default class epubHandler implements FormatHandler {
               style.textContent = text;
               link.replaceWith(style);
             } catch (e) {
-              ctx?.log(`Failed to fetch blob CSS: ${e}`, "error");
+              ctx?.log(
+                `Failed to fetch blob CSS: ${e instanceof Error ? e.message : String(e)}`,
+                "error",
+              );
             }
           }
         });
@@ -305,7 +333,7 @@ export default class epubHandler implements FormatHandler {
 
         outputFiles.push({
           name: `${baseName}.html`,
-          bytes: new TextEncoder().encode(finalHtml),
+          bytes: encode(finalHtml),
         });
       }
     }

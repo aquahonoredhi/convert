@@ -6,95 +6,23 @@ import { Instance } from "celaria-formats/class/maps/objects/Instance.mjs";
 import { PlayerSpawnPoint } from "celaria-formats/class/maps/objects/PlayerSpawnPoint.mjs";
 import { Sphere } from "celaria-formats/class/maps/objects/Sphere.mjs";
 import { TutorialHologram } from "celaria-formats/class/maps/objects/TutorialHologram.mjs";
-import type { FlatVector3, Vector3 } from "celaria-formats/types/data.mts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import { Buffer } from "buffer";
+import { changeExt, encode } from "src/common/index.ts";
 
-(globalThis as any).Buffer = Buffer;
-
-function putInstances(
-  map: EditableCelariaMap | CelariaMap,
-  plainOldInstances: AllPlainOldInstanceTypes[],
-) {
-  map.instances = plainOldInstances.map((plainOldInstance) => {
-    switch (plainOldInstance.instanceType) {
-      case "Block":
-        const block = new Block(plainOldInstance.type);
-        block.position = plainOldInstance.position;
-        block.rotation = plainOldInstance.rotation;
-        block.scale = plainOldInstance.scale;
-        block.type = plainOldInstance.type;
-        return block;
-      case "Barrier":
-        const barrier = new Barrier();
-        barrier.position = plainOldInstance.position;
-        barrier.rotation = plainOldInstance.rotation;
-        barrier.scale = plainOldInstance.scale;
-        return barrier;
-      case "Spawn point":
-        const playerSpawnPoint = new PlayerSpawnPoint();
-        playerSpawnPoint.position = plainOldInstance.position;
-        playerSpawnPoint.rotation = plainOldInstance.rotation;
-        return playerSpawnPoint;
-      case "Dummy":
-        const tutorialHologram = new TutorialHologram(plainOldInstance.type);
-        tutorialHologram.scale = plainOldInstance.scale;
-        tutorialHologram.rotation = plainOldInstance.rotation;
-        tutorialHologram.position = plainOldInstance.position;
-        return tutorialHologram;
-      case "Sphere":
-        const sphere = new Sphere();
-        sphere.position = plainOldInstance.position;
-        return sphere;
-    }
-  });
-}
+Object.assign(globalThis, { Buffer });
 
 class celariaMapHandler implements FormatHandler {
-  public name: string = "celariaMap";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "celariaMap";
+  public supportedFormats = [
+    Formats.OBJ.builder("obj").to(),
+    Formats.ECMAP.builder("ecmap").fromTo(),
+    Formats.CMAP.builder("cmap").from(),
+  ];
+  public ready = false;
   /**/
   async init() {
-    this.supportedFormats = [
-      {
-        name: "Wavefront OBJ",
-        format: "obj",
-        extension: "obj",
-        mime: "model/obj",
-        from: false,
-        to: true,
-        internal: "obj",
-        category: Category.MODEL,
-        lossless: false,
-      },
-      CommonFormats.JSON.builder("json").allowFrom(true).allowTo(true).markLossless(false),
-      {
-        name: "Editable Celaria Map",
-        format: "ecmap",
-        extension: "ecmap",
-        mime: "application/x-editable-celaria-map",
-        from: true,
-        to: true,
-        internal: "ecmap",
-        category: Category.DATA,
-        lossless: false,
-      },
-      {
-        name: "Celaria Map",
-        format: "cmap",
-        extension: "cmap",
-        mime: "application/x-celaria-map",
-        from: true,
-        to: false,
-        internal: "cmap",
-        category: Category.DATA,
-        lossless: false,
-      },
-    ];
-
     this.ready = true;
   }
 
@@ -104,98 +32,14 @@ class celariaMapHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     return inputFiles.map((file) => {
-      const baseName = file.name.replace(/\.[^.]+$/u, ""); // lifted from json5 handler.
       if (inputFormat.internal === "ecmap") {
         const editableCelariaMap = EditableCelariaMap.parse(Buffer.from(file.bytes));
-        if (outputFormat.internal === "json") {
-          const object: PlainOldEditableCelariaMap = {
-            mapType: "Editable Celaria map",
-            instances: [],
-            sunRotationHorizontal: editableCelariaMap.sunRotationHorizontal,
-            sunRotationVertical: editableCelariaMap.sunRotationVertical,
-            name: editableCelariaMap.name,
-            previewCamera: editableCelariaMap.previewCamera,
-          };
-          object.instances = editableCelariaMap.instances.map((instance) => {
-            switch (instance.instanceId) {
-              case 0: // Block
-                return {
-                  scale: instance.scale,
-                  type: instance.type,
-                  rotation: instance.rotation,
-                  instanceType: "Block",
-                  position: instance.position,
-                };
-              case 1: // Sphere
-                return {
-                  instanceType: "Sphere",
-                  position: instance.position,
-                };
-              case 2: // Player spawn point
-                return {
-                  rotation: instance.rotation,
-                  instanceType: "Spawn point",
-                  position: instance.position,
-                };
-              case 3: // Barrier (Wall)
-              case 4: // Barrier (Floor)
-                return {
-                  scale: instance.scale,
-                  rotation: instance.rotation,
-                  instanceType: "Barrier",
-                  position: instance.position,
-                };
-              case 128:
-                return {
-                  scale: instance.scale,
-                  type: instance.type,
-                  instanceType: "Dummy",
-                  rotation: instance.rotation,
-                  position: instance.position,
-                };
-            }
-          });
-          return {
-            name: `${baseName}.${outputFormat.extension}`,
-            bytes: new TextEncoder().encode(JSON.stringify(object)),
-          };
-        }
         if (outputFormat.internal === "obj") {
           const modelBuilder = new ModelBuilder(editableCelariaMap.instances);
           modelBuilder.do();
           return {
-            name: `${baseName}.${outputFormat.extension}`,
-            bytes: new TextEncoder().encode(modelBuilder.toString()),
-          };
-        }
-      }
-      if (inputFormat.internal === "json") {
-        const typedParsedObject = celariaMapHandler.determinePlainOldSerializedFormat(
-          JSON.parse(new TextDecoder().decode(file.bytes)),
-        );
-        if (!typedParsedObject) throw new Error("Can't handle unknown parsed object.");
-        if (outputFormat.internal === "ecmap") {
-          const editableCelariaMap = new EditableCelariaMap();
-          putInstances(editableCelariaMap, typedParsedObject.instances);
-          const suitableVersion = celariaMapHandler.determineSuitableVersion(
-            "ecmap",
-            editableCelariaMap.instances,
-          );
-          editableCelariaMap.previewCamera = typedParsedObject.previewCamera;
-          editableCelariaMap.name = typedParsedObject.name;
-          editableCelariaMap.sunRotationHorizontal = typedParsedObject.sunRotationHorizontal;
-          editableCelariaMap.sunRotationVertical = typedParsedObject.sunRotationVertical;
-          editableCelariaMap.instances.forEach((instance) => {
-            if (instance.instanceId === 0 && instance.type === Block.types.checkpoint)
-              editableCelariaMap.checkpointOrder.add(instance);
-          });
-          const goal = editableCelariaMap.instances.find(
-            (instance) => instance.instanceId === 0 && instance.type === Block.types.goal,
-          ) as Block | undefined;
-          if (goal) editableCelariaMap.checkpointOrder.add(goal);
-          return {
-            name: `${baseName}.${outputFormat.extension}`,
-            bytes: Uint8Array.from(editableCelariaMap.serialize(suitableVersion)),
+            name: changeExt(file.name, outputFormat.extension),
+            bytes: encode(modelBuilder.toString()),
           };
         }
       }
@@ -213,7 +57,7 @@ class celariaMapHandler implements FormatHandler {
           editableCelariaMap.instances,
         );
         return {
-          name: `${baseName}.${outputFormat.extension}`,
+          name: changeExt(file.name, outputFormat.extension),
           bytes: Uint8Array.from(editableCelariaMap.serialize(suitableVersion)),
         };
       }
@@ -221,18 +65,6 @@ class celariaMapHandler implements FormatHandler {
         `Unsupported conversion path: ${inputFormat.internal} -> ${outputFormat.internal}`,
       );
     });
-  }
-  /** Determines what a plain old JavaScript object is _likely_ to be. I don't do strict validation. */
-  static determinePlainOldSerializedFormat(
-    plainOldObject: any,
-  ): false | PlainOldEditableCelariaMap {
-    if (typeof plainOldObject !== "object") return false;
-    if (Array.isArray(plainOldObject)) return false;
-    // Check what the object identifies itself.
-    if (plainOldObject.mapType === "Editable Celaria map")
-      return plainOldObject as PlainOldEditableCelariaMap;
-    if (plainOldObject.mapType === "Celaria map") throw new Error("Not implemented.");
-    return false;
   }
   /** Determine a version most suitable for compatibility based on the given {@link instances}. Prefers versions for the latest available free open alpha version. Otherwise uses latest commercial Steam release when encountering new objects like {@link Barrier}s. */
   static determineSuitableVersion(format: "ecmap" | "cmap", instances: Instance[]): number {
@@ -293,7 +125,7 @@ class ModelBuilder {
           this.objString += `v ${result.map((vertexComponent, componentIndex) => vertexComponent + instance.position[componentIndex]).join(" ")}\n`;
         });
         // add face definition
-        this.objString += `f ${this.vertexCount}/${this.vertexCount} ${this.vertexCount + 1}/${this.vertexCount + 1} ${this.vertexCount + 2}/${this.vertexCount + 2}\n`;
+        this.objString += `f ${this.vertexCount} ${this.vertexCount + 1} ${this.vertexCount + 2}\n`;
         this.vertexCount += 3;
       }
     });
@@ -380,61 +212,6 @@ class ModelBuilder {
 
 // #region Types
 type AllInstanceTypes = Block | PlayerSpawnPoint | Sphere | TutorialHologram | Barrier;
-type AllPlainOldInstanceTypes =
-  | PlainOldBlock
-  | PlainOldBarrier
-  | PlainOldPlayerSpawnPoint
-  | PlainOldTutorialHologram
-  | PlainOldSphere;
-
-interface PlainOldBaseCelariaMap {
-  mapType: string;
-  instances: AllPlainOldInstanceTypes[];
-  sunRotationHorizontal: number;
-  sunRotationVertical: number;
-  previewCamera: {
-    from: Vector3;
-    to: Vector3;
-  };
-  name: string;
-}
-/** I'm a plain old JavaScript object for an editable Celaria map. */
-interface PlainOldEditableCelariaMap extends PlainOldBaseCelariaMap {
-  mapType: "Editable Celaria map";
-}
-
-interface PlainOldInstance {
-  position: Vector3;
-  instanceType: string;
-}
-
-interface PlainOldBlock extends PlainOldInstance {
-  type: number;
-  rotation: number;
-  scale: Vector3;
-  instanceType: "Block";
-}
-
-interface PlainOldSphere extends PlainOldInstance {
-  instanceType: "Sphere";
-}
-
-interface PlainOldPlayerSpawnPoint extends PlainOldInstance {
-  rotation: number;
-  instanceType: "Spawn point";
-}
-
-interface PlainOldBarrier extends PlainOldInstance {
-  rotation: number;
-  scale: FlatVector3;
-  instanceType: "Barrier";
-}
-
-interface PlainOldTutorialHologram extends PlainOldInstance {
-  type: number;
-  scale: Vector3;
-  rotation: number;
-  instanceType: "Dummy";
-}
+// #endregion
 
 export default celariaMapHandler;

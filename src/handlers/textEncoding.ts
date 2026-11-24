@@ -1,5 +1,6 @@
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FormatHandler, FileData, FileFormat } from "../FormatHandler.ts";
+import { decode, encode } from "src/common/index.ts";
 
 function hasPrefix(bytes: Uint8Array, prefix: number[]) {
   if (bytes.length < prefix.length) return false;
@@ -23,8 +24,8 @@ function decodeUTF16(bytes: Uint8Array, littleEndian: boolean) {
   for (let i = 0; i + 2 <= dv.byteLength;) {
     const w1 = dv.getUint16(i, littleEndian);
     i += 2;
-    if (w1 >= 0xd800 && w1 <= 0xdbff && i + 2 <= dv.byteLength) {
-      const w2 = dv.getUint16(i, littleEndian);
+    const w2 = i + 2 <= dv.byteLength ? dv.getUint16(i, littleEndian) : -1;
+    if (w1 >= 0xd800 && w1 <= 0xdbff && w2 >= 0xdc00 && w2 <= 0xdfff) {
       i += 2;
       const cp = (((w1 - 0xd800) << 10) | (w2 - 0xdc00)) + 0x10000;
       out += String.fromCodePoint(cp);
@@ -36,10 +37,9 @@ function decodeUTF16(bytes: Uint8Array, littleEndian: boolean) {
 }
 
 function encodeUTF16(str: string, littleEndian: boolean, addBOM = false) {
-  // count code units
   const codepoints = Array.from(str);
-  // worst case 2 units per code point
-  const buf = new ArrayBuffer(codepoints.length * 2 + (addBOM ? 2 : 0));
+  // JavaScript string length counts UTF-16 code units, including surrogate pairs.
+  const buf = new ArrayBuffer(str.length * 2 + (addBOM ? 2 : 0));
   const dv = new DataView(buf);
   let offset = 0;
   if (addBOM) {
@@ -69,8 +69,7 @@ function encodeUTF32(str: string, littleEndian: boolean, addBOM = false) {
   const dv = new DataView(buf);
   let offset = 0;
   if (addBOM) {
-    if (littleEndian) dv.setUint32(0, 0xff_fe_00_00, true);
-    else dv.setUint32(0, 0x00_00_fe_ff, false);
+    dv.setUint32(0, 0x00_00_fe_ff, littleEndian);
     offset += 4;
   }
   for (const cp of codepoints) {
@@ -88,89 +87,26 @@ function decodeUsingTextDecoder(bytes: Uint8Array, label: string) {
     return dec.decode(bytes);
   } catch {
     // fallback
-    const dec = new TextDecoder("utf-8");
-    return dec.decode(bytes);
+    return decode(bytes);
   }
 }
 
-const formats: FileFormat[] = [
-  CommonFormats.TEXT.supported("txt", true, true, true), // May or may not have BOM depending on browser
-  {
-    name: "Plain Text (UTF-8 without BOM)",
-    format: "UTF-8 without BOM",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-8 without BOM",
-    from: false,
-    to: true,
-    internal: "utf8NB",
-    category: Category.TEXT,
-    lossless: true,
-  }, // In case the broeser defaults to with BOM, we can choose to force BOMless UTF-8.
-  {
-    name: "Plain Text (UTF-8 with BOM)",
-    format: "UTF-8 with BOM",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-8 with BOM",
-    from: false,
-    to: true,
-    internal: "utf8WB",
-    category: Category.TEXT,
-    lossless: true,
-  }, // UTF8 with forced BOM.
-  {
-    name: "Plain Text (UTF-16 LE)",
-    format: "UTF-16 LE",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-16LE",
-    from: true,
-    to: true,
-    internal: "utf16le",
-    category: Category.TEXT,
-    lossless: true,
-  },
-  {
-    name: "Plain Text (UTF-16 BE)",
-    format: "UTF-16 BE",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-16BE",
-    from: true,
-    to: true,
-    internal: "utf16be",
-    category: Category.TEXT,
-    lossless: true,
-  },
-  {
-    name: "Plain Text (UTF-32 LE)",
-    format: "UTF-32 LE",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-32LE",
-    from: true,
-    to: true,
-    internal: "utf32le",
-    category: Category.TEXT,
-    lossless: true,
-  },
-  {
-    name: "Plain Text (UTF-32 BE)",
-    format: "UTF-32 BE",
-    extension: "txt",
-    mime: "text/plain; charset=UTF-32BE",
-    from: true,
-    to: true,
-    internal: "utf32be",
-    category: Category.TEXT,
-    lossless: true,
-  },
-];
-
 export default class textEncodingHandler implements FormatHandler {
-  name = "textEncoding";
-  supportedFormats = formats;
-  ready = true;
-  offload: boolean = true;
-  init = async () => {
+  public readonly name = "textEncoding";
+  public supportedFormats = [
+    Formats.TEXT.builder("txt").lossless().fromTo(), // May or may not have BOM depending on browser
+    Formats.TEXT_UTF8_NO_BOM.builder("utf8NB").lossless().to(), // In case the broeser defaults to with BOM, we can choose to force BOMless UTF-8.
+    Formats.TEXT_UTF8_BOM.builder("utf8WB").lossless().to(), // UTF8 with forced BOM.
+    Formats.TEXT_UTF16LE.builder("utf16le").lossless().fromTo(),
+    Formats.TEXT_UTF16BE.builder("utf16be").lossless().fromTo(),
+    Formats.TEXT_UTF32LE.builder("utf32le").lossless().fromTo(),
+    Formats.TEXT_UTF32BE.builder("utf32be").lossless().fromTo(),
+  ];
+  public ready = false;
+
+  async init() {
     this.ready = true;
-  };
+  }
 
   async doConvert(inputFiles: FileData[], inputFormat: FileFormat, outputFormat: FileFormat) {
     const results: FileData[] = [];
@@ -180,7 +116,7 @@ export default class textEncodingHandler implements FormatHandler {
 
       // Determine input encoding: prefer inputFormat.internal when present
       const inf = inputFormat.internal;
-      if (inf === "txt" || inf === "utf8NB") {
+      if (inf === "utf8NB") {
         text = decodeUsingTextDecoder(inBytes, "utf-8");
       } else if (inf === "utf8WB") {
         text = decodeUsingTextDecoder(inBytes.subarray(3), "utf-8");
@@ -210,11 +146,13 @@ export default class textEncodingHandler implements FormatHandler {
         }
       }
 
+      if (text.startsWith("\uFEFF")) text = text.slice(1);
+
       // Now encode to output format
       const outf = (outputFormat && outputFormat.internal) || "utf8NB";
-      let outBytes: Uint8Array;
+      let outBytes: Uint8Array<ArrayBuffer>;
       if (outf === "utf8NB") {
-        const utf8Bytes = new TextEncoder().encode(text);
+        const utf8Bytes = encode(text);
         if (utf8Bytes.length >= 3 && hasPrefix(utf8Bytes, [0xef, 0xbb, 0xbf])) {
           // has BOM, remove it
           outBytes = utf8Bytes.subarray(3);
@@ -223,7 +161,7 @@ export default class textEncodingHandler implements FormatHandler {
           outBytes = utf8Bytes;
         }
       } else if (outf === "utf8WB") {
-        const utf8Bytes = new TextEncoder().encode(text);
+        const utf8Bytes = encode(text);
         if (utf8Bytes.length >= 3 && hasPrefix(utf8Bytes, [0xef, 0xbb, 0xbf])) {
           // already has BOM, don't add another
           outBytes = utf8Bytes;
@@ -242,7 +180,7 @@ export default class textEncodingHandler implements FormatHandler {
       } else if (outf === "utf32be") {
         outBytes = encodeUTF32(text, false, true);
       } else {
-        outBytes = new TextEncoder().encode(text);
+        outBytes = encode(text);
       }
 
       results.push({ name: file.name, bytes: outBytes });

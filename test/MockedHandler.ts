@@ -1,4 +1,5 @@
-import { FileData, FileFormat, FormatHandler } from "../src/FormatHandler";
+import type { FileData, FileFormat, FormatHandler } from "../src/FormatHandler";
+import type { HandlerName } from "../src/handlers/index.ts";
 
 /**
  * A mock implementation of the FormatHandler interface for testing purposes.
@@ -6,12 +7,10 @@ import { FileData, FileFormat, FormatHandler } from "../src/FormatHandler";
  */
 export class MockedHandler implements FormatHandler {
   constructor(
-    public name: string,
+    public readonly name: HandlerName,
     public supportedFormats?: FileFormat[],
-    public supportAnyInput?: boolean,
   ) {}
-  ready: boolean = false;
-  offload: boolean = true;
+  public ready = false;
   init() {
     this.ready = true;
     return Promise.resolve();
@@ -20,7 +19,6 @@ export class MockedHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    _args?: string[],
   ): Promise<FileData[]> {
     return Promise.resolve(inputFiles);
   }

@@ -1,27 +1,17 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
+import { compressGzip } from "src/common/gzip.ts";
 
-class txtToInfiniteCraftHandler implements FormatHandler {
-  public name: string = "txtToInfiniteCraft";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+class infiniteCraftHandler implements FormatHandler {
+  public readonly name = "infiniteCraft";
+  public supportedFormats = [
+    Formats.TEXT.builder("text").from(),
+    Formats.INFINITE_CRAFT.builder("ic").to(),
+  ];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.TEXT.supported("text", true, false),
-      {
-        name: "Infinite Craft Save File",
-        format: "ic",
-        extension: "ic",
-        mime: "application/x-infinite-craft-ic",
-        internal: "ic",
-        category: Category.ARCHIVE,
-        from: false,
-        to: true,
-        lossless: false,
-      },
-    ];
     this.ready = true;
   }
 
@@ -30,8 +20,11 @@ class txtToInfiniteCraftHandler implements FormatHandler {
     inputFormat: FileFormat,
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
-    const inputFile = inputFiles[0];
-    const text = new TextDecoder().decode(inputFile.bytes);
+    return Promise.all(inputFiles.map((inputFile) => this.convertFile(inputFile)));
+  }
+
+  private async convertFile(inputFile: FileData): Promise<FileData> {
+    const text = decode(inputFile.bytes);
     const words = text.split(/[^a-zA-Z0-9']+/).filter(Boolean);
 
     const emojis = ["💧", "🔥", "🌬️", "🌍", "⚡", "❄️", "🌟", "🌈", "🌊", "🍃"];
@@ -45,7 +38,7 @@ class txtToInfiniteCraftHandler implements FormatHandler {
       version: "1.0",
       created: Date.now(),
       updated: 0,
-      instances: [] as any[],
+      instances: [],
       items: words.map((word, index) => ({
         id: index,
         text: word,
@@ -53,109 +46,16 @@ class txtToInfiniteCraftHandler implements FormatHandler {
       })),
     };
 
-    const outputBytes = new TextEncoder().encode(JSON.stringify(jsonData, null, 2));
+    const outputBytes = encode(JSON.stringify(jsonData, null, 2));
 
-    const cs = new CompressionStream("gzip");
-
-    const inputStream = new Response(outputBytes).body!;
-
-    const compressedStream = inputStream.pipeThrough(cs);
-
-    const compressedBytes = new Uint8Array(await new Response(compressedStream).arrayBuffer());
+    const compressedBytes = await compressGzip(outputBytes);
 
     const inputFileName = inputFile.name;
 
-    const outputFileName = inputFileName.replace(/\.txt$/i, ".ic");
+    const outputFileName = changeExt(inputFileName, "ic");
 
-    const outputFiles: FileData[] = [
-      {
-        name: outputFileName,
-        bytes: compressedBytes,
-      },
-    ];
-    return outputFiles;
+    return { name: outputFileName, bytes: compressedBytes };
   }
 }
 
-class infiniteCraftToJsonHandler implements FormatHandler {
-  public name: string = "infiniteCraftToJson";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
-
-  async init() {
-    this.supportedFormats = [
-      {
-        name: "Infinite Craft Save File",
-        format: "ic",
-        extension: "ic",
-        mime: "application/x-infinite-craft-ic",
-        internal: "ic",
-        category: Category.ARCHIVE,
-        from: true,
-        to: false,
-        lossless: true,
-      },
-      CommonFormats.JSON.supported("json", false, true, true),
-    ];
-    this.ready = true;
-  }
-
-  async doConvert(
-    inputFiles: FileData[],
-    inputFormat: FileFormat,
-    outputFormat: FileFormat,
-  ): Promise<FileData[]> {
-    // Credit to als.ts
-    if (inputFormat.internal !== "ic" || outputFormat.internal !== "json") {
-      throw new TypeError(
-        `Unsupported conversion path: ${inputFormat.internal} -> ${outputFormat.internal}`,
-      );
-    }
-
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    const encoder = new TextEncoder();
-
-    return Promise.all(
-      inputFiles.map(async (inputFile) => {
-        if (
-          inputFile.bytes.length < 2 ||
-          inputFile.bytes[0] !== 0x1f ||
-          inputFile.bytes[1] !== 0x8b
-        ) {
-          throw new Error("Invalid IC file: expected gzip-compressed data.");
-        }
-
-        const decompressedStream = new Blob([inputFile.bytes as BlobPart])
-          .stream()
-          .pipeThrough(new DecompressionStream("gzip"));
-        const decompressedBytes = new Uint8Array(
-          await new Response(decompressedStream).arrayBuffer(),
-        );
-
-        let json: string;
-        try {
-          json = decoder.decode(decompressedBytes);
-        } catch {
-          throw new Error("Invalid IC file: decompressed data is not UTF-8 JSON.");
-        }
-        if (json.trimStart().startsWith("[")) {
-          throw new Error("Invalid IC file: decompressed data should not be an array in JSON.");
-        } else if (!json.trimStart().startsWith("{")) {
-          throw new Error("Invalid IC file: decompressed data is not JSON.");
-        }
-
-        const baseNameParts = inputFile.name.split(".");
-        const baseName =
-          baseNameParts.length > 1 ? baseNameParts.slice(0, -1).join(".") : inputFile.name;
-
-        return {
-          name: `${baseName}.json`,
-          bytes: encoder.encode(json),
-        };
-      }),
-    );
-  }
-}
-
-export { txtToInfiniteCraftHandler, infiniteCraftToJsonHandler };
+export default infiniteCraftHandler;

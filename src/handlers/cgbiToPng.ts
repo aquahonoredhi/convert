@@ -1,8 +1,9 @@
-import pako from "pako";
+import * as pako from "pako";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt } from "src/common/index.ts";
 
-async function revertCgBIBuffer(input: Uint8Array | ArrayBuffer): Promise<Uint8Array> {
+async function revertCgBIBuffer(input: Uint8Array | ArrayBuffer): Promise<Uint8Array<ArrayBuffer>> {
   const buffer = input instanceof Uint8Array ? input : new Uint8Array(input);
 
   const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -89,18 +90,44 @@ async function revertCgBIBuffer(input: Uint8Array | ArrayBuffer): Promise<Uint8A
     if (type === "IEND" && isIphoneCompressed) {
       const uncompressed = pako.inflateRaw(idatCgbiData);
 
-      const newData = new Uint8Array(uncompressed.length);
-      let i = 0;
+      const stride = width * 4;
+      const newData = new Uint8Array((stride + 1) * height);
+      const prev = new Uint8Array(stride);
+      const row = new Uint8Array(stride);
       for (let y = 0; y < height; y++) {
-        newData[i] = uncompressed[i]; // filter byte
-        i++;
-        for (let x = 0; x < width; x++) {
-          newData[i] = uncompressed[i + 2]; // B → R
-          newData[i + 1] = uncompressed[i + 1]; // G
-          newData[i + 2] = uncompressed[i]; // R → B
-          newData[i + 3] = uncompressed[i + 3]; // A
-          i += 4;
+        const inStart = y * (stride + 1);
+        const filter = uncompressed[inStart];
+        for (let x = 0; x < stride; x++) {
+          const raw = uncompressed[inStart + 1 + x] ?? 0;
+          const left = x >= 4 ? row[x - 4] : 0;
+          const up = prev[x];
+          const upLeft = x >= 4 ? prev[x - 4] : 0;
+          let predictor = 0;
+          if (filter === 1) predictor = left;
+          else if (filter === 2) predictor = up;
+          else if (filter === 3) predictor = (left + up) >> 1;
+          else if (filter === 4) {
+            const p = left + up - upLeft;
+            const pa = Math.abs(p - left);
+            const pb = Math.abs(p - up);
+            const pc = Math.abs(p - upLeft);
+            predictor = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+          }
+          row[x] = (raw + predictor) & 0xff;
         }
+
+        const outStart = y * (stride + 1);
+        newData[outStart] = 0; // filter: none
+        for (let x = 0; x < stride; x += 4) {
+          const a = row[x + 3];
+          const unpremultiply = (c: number) =>
+            a === 0 ? 0 : Math.min(255, Math.round((c * 255) / a));
+          newData[outStart + 1 + x] = unpremultiply(row[x + 2]); // B → R
+          newData[outStart + 2 + x] = unpremultiply(row[x + 1]); // G
+          newData[outStart + 3 + x] = unpremultiply(row[x]); // R → B
+          newData[outStart + 4 + x] = a;
+        }
+        prev.set(row);
       }
 
       const compressedIdat = pako.deflate(newData);
@@ -146,24 +173,12 @@ async function revertCgBIBuffer(input: Uint8Array | ArrayBuffer): Promise<Uint8A
 }
 
 class cgbiToPngHandler implements FormatHandler {
-  public name = "cgbiToPng";
-  public ready = true;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "iPhone optimized CgBI PNG",
-      format: "cgbi-png",
-      extension: "png",
-      mime: "image/png",
-      from: true,
-      to: false,
-      internal: "cgbi-png",
-      category: Category.IMAGE,
-      lossless: true,
-    },
-    CommonFormats.PNG.supported("png", false, true, true),
+  public readonly name = "cgbiToPng";
+  public supportedFormats = [
+    Formats.CGBI_PNG.builder("cgbi-png").lossless().from(),
+    Formats.PNG.builder("png").lossless().to(),
   ];
+  public ready = false;
 
   async init(): Promise<void> {
     this.ready = true;
@@ -173,7 +188,6 @@ class cgbiToPngHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    _args?: string[],
   ): Promise<FileData[]> {
     if (inputFormat.internal !== "cgbi-png" || outputFormat.internal !== "png") {
       throw new TypeError(
@@ -187,18 +201,19 @@ class cgbiToPngHandler implements FormatHandler {
       try {
         const standardPng = await revertCgBIBuffer(inputFile.bytes);
 
-        const dotIndex = inputFile.name.lastIndexOf(".");
-        const baseName = dotIndex !== -1 ? inputFile.name.substring(0, dotIndex) : inputFile.name;
-        const outputName = `${baseName}.${outputFormat.extension}`;
+        const outputName = changeExt(inputFile.name, outputFormat.extension);
 
         outputFiles.push({
           bytes: standardPng,
           name: outputName,
         });
       } catch (error) {
-        throw new Error(`Failed to convert ${inputFile.name}: ${(error as Error).message}`, {
-          cause: error,
-        });
+        throw new Error(
+          `Failed to convert ${inputFile.name}: ${error instanceof Error ? error.message : String(error)}`,
+          {
+            cause: error,
+          },
+        );
       }
     }
 

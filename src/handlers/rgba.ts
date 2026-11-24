@@ -1,46 +1,23 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { blobToCanvas, canvasToBlob, createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 class rgbaHandler implements FormatHandler {
-  public name: string = "rgba";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "rgba";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().fromTo(),
+    Formats.RGB.builder("rgb").fromTo(),
+    Formats.RGBA.builder("rgba").lossless().fromTo(),
+  ];
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.PNG.supported("png", true, true, true),
-      {
-        name: "Raw red, green, and blue samples",
-        format: "rgb",
-        extension: "rgb",
-        mime: "image/x-rgb",
-        from: true,
-        to: true,
-        internal: "rgb",
-        category: Category.IMAGE,
-        lossless: false,
-      },
-      {
-        name: "Raw red, green, blue, and alpha samples",
-        format: "rgba",
-        extension: "rgba",
-        mime: "image/x-rgba",
-        from: true,
-        to: true,
-        internal: "rgba",
-        category: Category.IMAGE,
-        lossless: true,
-      },
-    ];
-
-    this.#canvas = new OffscreenCanvas(1, 1);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas();
 
     this.ready = true;
   }
@@ -52,24 +29,20 @@ class rgbaHandler implements FormatHandler {
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
 
-    if (!this.#canvas || !this.#ctx) {
+    if (!this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { canvas, ctx } = this.#bundle;
 
     for (const file of inputFiles) {
       let new_file_bytes = new Uint8Array(file.bytes);
 
-      if (inputFormat.mime === CommonFormats.PNG.mime) {
+      if (inputFormat.mime === Formats.PNG.mime) {
         if (outputFormat.internal === "rgba") {
           // Some code copied from mcmap.ts
-          const blob = new Blob([file.bytes as BlobPart], { type: inputFormat.mime });
-          const image = await createImageBitmap(blob);
+          await blobToCanvas(this.#bundle, file.bytes, inputFormat.mime);
 
-          this.#canvas.width = image.width;
-          this.#canvas.height = image.height;
-          this.#ctx.drawImage(image, 0, 0);
-
-          const pixels = this.#ctx.getImageData(0, 0, this.#canvas.width, this.#canvas.height);
+          const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
           new_file_bytes = new Uint8Array(pixels.data);
         } else if (outputFormat.internal === "rgb") {
@@ -104,7 +77,7 @@ class rgbaHandler implements FormatHandler {
             }
           }
           new_file_bytes = new Uint8Array(writer_array);
-        } else if (outputFormat.mime === CommonFormats.PNG.mime) {
+        } else if (outputFormat.mime === Formats.PNG.mime) {
           throw new TypeError(
             "This handler doesn't need to convert rgb to png, let ImageMagik do that.",
           );
@@ -131,7 +104,7 @@ class rgbaHandler implements FormatHandler {
             }
           }
           new_file_bytes = new Uint8Array(writer_array);
-        } else if (outputFormat.mime === CommonFormats.PNG.mime) {
+        } else if (outputFormat.mime === Formats.PNG.mime) {
           // Determine image dimensions: smallest number x such that x^2 is >= total samples
           const total_samples = new_file_bytes.length / 4;
           let image_sw = 0;
@@ -144,13 +117,13 @@ class rgbaHandler implements FormatHandler {
           }
 
           // Set canvas dimensions to this value
-          this.#canvas.width = image_sw;
-          this.#canvas.height = image_sw;
+          canvas.width = image_sw;
+          canvas.height = image_sw;
 
           // Determine color per-pixel and write that value to the buffer
           let color = [0, 0, 0];
           const rgba: number[] = [];
-          for (let i = 0; i < this.#canvas.width * this.#canvas.height; i++) {
+          for (let i = 0; i < canvas.width * canvas.height; i++) {
             try {
               color = [
                 new_file_bytes[0 + i * 4],
@@ -167,16 +140,13 @@ class rgbaHandler implements FormatHandler {
           // Writes our results to the canvas
           const image_data = new ImageData(
             new Uint8ClampedArray(rgba),
-            this.#canvas.width,
-            this.#canvas.height,
+            canvas.width,
+            canvas.height,
           );
 
-          this.#ctx.putImageData(image_data, 0, 0);
+          ctx.putImageData(image_data, 0, 0);
 
-          const blob = await this.#canvas.convertToBlob({
-            type: outputFormat.mime,
-          });
-          new_file_bytes = new Uint8Array(await blob.arrayBuffer());
+          new_file_bytes = await canvasToBlob(this.#bundle, outputFormat.mime);
         } else {
           throw new TypeError(
             `Unsupported conversion path: ${inputFormat.internal} -> ${outputFormat.internal}`,
@@ -187,7 +157,7 @@ class rgbaHandler implements FormatHandler {
       }
 
       outputFiles.push({
-        name: file.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension,
+        name: changeExt(file.name, outputFormat.extension),
         bytes: new_file_bytes,
       });
     }

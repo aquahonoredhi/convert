@@ -1,27 +1,16 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 class minecraftLangHandler implements FormatHandler {
-  public name: string = "minecraftLang";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "minecraftLang";
+  public supportedFormats = [
+    Formats.JSON.builder("json").lossless().fromTo(),
+    Formats.MC_LANG.builder("minecraft-lang").lossless().fromTo(),
+  ];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.JSON.builder("json").markLossless(true).allowFrom(true).allowTo(true),
-
-      {
-        name: "Minecraft Language Localization File",
-        format: "minecraft-lang",
-        extension: "lang",
-        mime: "text/plain",
-        from: true,
-        to: true,
-        internal: "minecraft-lang",
-        lossless: true,
-      },
-    ];
     this.ready = true;
   }
 
@@ -33,7 +22,7 @@ class minecraftLangHandler implements FormatHandler {
     const outputFiles: FileData[] = [];
 
     for (const file of inputFiles) {
-      const text = new TextDecoder().decode(file.bytes);
+      const text = decode(file.bytes);
 
       let resultText: string;
 
@@ -46,12 +35,7 @@ class minecraftLangHandler implements FormatHandler {
         }
 
         resultText = Object.entries(obj)
-          .map(([k, v]) => {
-            if (typeof v === "object") {
-              return `${k}=${JSON.stringify(v)}`;
-            }
-            return `${k}=${v}`;
-          })
+          .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
           .join("\n");
       }
 
@@ -82,8 +66,8 @@ class minecraftLangHandler implements FormatHandler {
       }
 
       outputFiles.push({
-        name: file.name.split(".").slice(0, -1).join("."),
-        bytes: new TextEncoder().encode(resultText),
+        name: changeExt(file.name, outputFormat.extension),
+        bytes: encode(resultText),
       });
     }
 

@@ -7,33 +7,45 @@ import {
   MagickGeometry,
 } from "@imagemagick/magick-wasm";
 
+function toMagickFormat(name: string): MagickFormat {
+  const format = Object.values(MagickFormat).find((format) => format === name);
+  if (!format) throw new Error(`ImageMagick doesn't know the format "${name}".`);
+  return format;
+}
+
 import mime from "mime";
+import magickWasmUrl from "@imagemagick/magick-wasm/magick.wasm?url";
 import normalizeMimeType from "../normalizeMimeType.ts";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats, { Category, isCategory } from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import type { ConvertContext } from "../ui/ProgressStore.js";
+import { changeExt } from "src/common/index.ts";
+import { resolveSize } from "src/common/canvas.ts";
+import type { FormatOptions } from "src/Settings.ts";
+
+// modules that accept quality
+const QUALITY_MODULES: string[] = ["JPEG", "JP2", "WEBP", "JXL", "HEIC"];
+const RESIZE: FormatOptions = { width: true, height: true };
 
 class ImageMagickHandler implements FormatHandler {
-  public name: string = "ImageMagick";
-
+  public readonly name = "ImageMagick";
   public supportedFormats: FileFormat[] = [];
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
+  public abortable = true;
 
   async init() {
-    const wasmLocation = "/convert/wasm/magick.wasm";
-    const wasmBuffer = await fetch(wasmLocation).then((r) => r.arrayBuffer());
-    const wasmBytes = new Uint8Array(wasmBuffer);
+    const wasmBytes = await fetch(magickWasmUrl).then((r) => r.bytes());
 
     await initializeImageMagick(wasmBytes);
 
+    this.supportedFormats = [];
     Magick.supportedFormats.forEach((format) => {
       const formatName = format.format.toLowerCase();
       if (formatName === "apng") return;
       if (formatName === "svg") return;
       if (formatName === "ttf") return;
       if (formatName === "otf") return;
+      if (formatName === "avi") return;
       let mimeType = format.mimeType || mime.getType(formatName);
       if (
         !mimeType ||
@@ -47,13 +59,18 @@ class ImageMagickHandler implements FormatHandler {
 
       // ImageMagick _really_ likes mislabeling formats
       let description = format.description;
-      if (mimeType === "image/jpeg") description = CommonFormats.JPEG.name;
-      if (mimeType === "image/gif") description = CommonFormats.GIF.name;
-      if (mimeType === "image/webp") description = CommonFormats.WEBP.name;
+      if (mimeType === "image/jpeg") description = Formats.JPEG.name;
+      if (mimeType === "image/gif") description = Formats.GIF.name;
+      if (mimeType === "image/webp") description = Formats.WEBP.name;
       if (formatName === "ico") description = "Microsoft Windows ICO";
       if (formatName === "mpo") description = "Multi-Picture Object";
       if (formatName === "vst") description = "Microsoft Visio Template";
 
+      const mimeCategory = mimeType.split("/")[0];
+      let category;
+      if (isCategory(mimeCategory)) category = mimeCategory;
+      else if (mimeType === "application/pdf") category = Category.DOCUMENT;
+      else category = Category.IMAGE;
       this.supportedFormats.push({
         name: description,
         format: formatName === "jpg" ? "jpeg" : formatName,
@@ -62,8 +79,13 @@ class ImageMagickHandler implements FormatHandler {
         from: mimeType === "application/pdf" ? false : format.supportsReading,
         to: format.supportsWriting,
         internal: format.format,
-        category: mimeType.split("/")[0],
+        category,
         lossless: ["png", "bmp", "tiff"].includes(formatName),
+        options: !format.supportsWriting
+          ? undefined
+          : QUALITY_MODULES.includes(format.moduleFormat)
+            ? { ...RESIZE, quality: true }
+            : RESIZE,
       });
     });
 
@@ -85,22 +107,23 @@ class ImageMagickHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
-    args?: string[],
     ctx?: ConvertContext,
   ): Promise<FileData[]> {
-    const inputMagickFormat = inputFormat.internal as MagickFormat;
-    const outputMagickFormat = outputFormat.internal as MagickFormat;
+    const inputMagickFormat = toMagickFormat(inputFormat.internal);
+    const outputMagickFormat = toMagickFormat(outputFormat.internal);
 
     const inputSettings = new MagickReadSettings();
     inputSettings.format = inputMagickFormat;
 
+    const { width, height, quality } = ctx?.options ?? {};
+
     ctx?.log(`Initialising ImageMagick for ${inputFiles.length} files...`);
 
-    const bytes: Uint8Array = await new Promise((resolve) => {
+    await ctx?.checkpoint();
+    const bytes = await new Promise<Uint8Array<ArrayBuffer>>((resolve) => {
       MagickImageCollection.use((outputCollection) => {
         let processedCount = 0;
         for (const inputFile of inputFiles) {
-          ctx?.throwIfAborted();
           const progressMsg = `Reading ${inputFile.name}...`;
           ctx?.progress(progressMsg, processedCount / inputFiles.length);
           ctx?.log(progressMsg);
@@ -135,6 +158,14 @@ class ImageMagickHandler implements FormatHandler {
                 image.resize(geometry);
               }
 
+              if (width || height) {
+                const size = resolveSize(image.width, image.height, { width, height });
+                const geometry = new MagickGeometry(size.width, size.height);
+                geometry.ignoreAspectRatio = true;
+                image.resize(geometry);
+              }
+              if (quality) image.quality = quality;
+
               outputCollection.push(image);
               frameIndex++;
             }
@@ -152,8 +183,7 @@ class ImageMagickHandler implements FormatHandler {
       });
     });
 
-    const baseName = inputFiles[0].name.split(".").slice(0, -1).join(".");
-    const name = baseName + "." + outputFormat.extension;
+    const name = changeExt(inputFiles[0].name, outputFormat.extension);
 
     ctx?.progress("Conversion complete!", 1);
     ctx?.log(

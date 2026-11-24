@@ -1,18 +1,28 @@
+import useFirstTabTarget from "src/ui/scripts/useFirstTabTarget";
 import { useEffect, useRef } from "preact/hooks";
 import { CurrentPage, LoadingToolsText, Pages } from "src/ui/AppState";
 import { goToUploadHome, SelectedFiles } from "src/main";
-import { Upload } from "lucide-preact";
-import { PopupData } from "src/ui";
+import { Files, Upload } from "lucide-preact";
+import useTooltip from "src/ui/scripts/useTooltip";
+import { PopupData } from "src/ui/AppState";
 import { openPopup } from "src/ui/PopupStore";
 
 import Logo from "src/ui/components/Logo";
 import HelpButton from "src/ui/components/HelpButton";
+import SettingsButton from "src/ui/components/SettingsButton";
 import Footer from "src/ui/components/Footer";
+import StyledButton, { ButtonVariant } from "src/ui/components/StyledButton";
 
 import "./index.css";
+import { type TargetedMouseEvent } from "preact";
 
 export default function UploadPage() {
+  const uploadRef = useRef<HTMLDivElement>(null);
+  useFirstTabTarget(uploadRef);
   const fileRef = useRef<HTMLInputElement>(null);
+  const formatsRef = useRef<HTMLButtonElement>(null);
+
+  useTooltip(formatsRef, "View supported formats");
 
   const handleClick = (ev: MouseEvent) => {
     ev.preventDefault();
@@ -36,7 +46,7 @@ export default function UploadPage() {
         dismissible: true,
         buttonText: "OK",
       };
-      openPopup();
+      openPopup(() => uploadRef.current);
       return;
     }
 
@@ -54,8 +64,8 @@ export default function UploadPage() {
     processFiles(event.clipboardData?.files);
   };
 
-  const handleLogoClick = (event: MouseEvent) => {
-    (event.currentTarget as HTMLButtonElement)
+  const handleLogoClick = (event: TargetedMouseEvent<HTMLButtonElement>) => {
+    event.currentTarget
       .querySelector(".logo-icon svg")
       ?.animate([{ transform: "rotate(0deg)" }, { transform: "rotate(-720deg)" }], {
         duration: 1000,
@@ -78,6 +88,9 @@ export default function UploadPage() {
         </div>
 
         <div
+          ref={uploadRef}
+          aria-label="Select files to convert"
+          aria-disabled={!formatsReady}
           className={`upload-dropzone ${!formatsReady ? "upload-dropzone--pending" : ""}`}
           onClick={handleClick}
           role="button"
@@ -97,7 +110,7 @@ export default function UploadPage() {
             name="uploadFile"
             id="uploadFile"
             onClick={(ev) => ev.stopPropagation()}
-            tabIndex={0}
+            tabIndex={-1}
             disabled={!formatsReady}
             onChange={handleChange}
           />
@@ -113,7 +126,20 @@ export default function UploadPage() {
         </div>
 
         <div className="upload-card-actions">
+          <SettingsButton />
           <HelpButton />
+          <StyledButton
+            buttonRef={formatsRef}
+            variant={ButtonVariant.Icon}
+            ariaLabel="View supported formats"
+            onClick={() => {
+              if (!formatsReady) return;
+              CurrentPage.value = Pages.Conversion;
+            }}
+            disabled={!formatsReady}
+          >
+            <Files size={18} aria-hidden="true" />
+          </StyledButton>
         </div>
       </div>
 

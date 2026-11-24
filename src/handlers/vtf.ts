@@ -1,6 +1,8 @@
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 import { BadMagicError, InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { canvasToBlob, createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 const TEXTUREFLAGS_ENVMAP = 0x00004000;
 const RESOURCE_HIGH_RES_IMAGE = 0x30;
@@ -57,6 +59,12 @@ const VTF_IMAGE_FORMAT = {
 } as const;
 
 type VTFImageFormat = (typeof VTF_IMAGE_FORMAT)[keyof typeof VTF_IMAGE_FORMAT];
+
+function toImageFormat(value: number): VTFImageFormat {
+  const format = Object.values(VTF_IMAGE_FORMAT).find((format) => format === value);
+  if (format === undefined) throw new Error(`Unknown VTF image format ${value}.`);
+  return format;
+}
 
 interface VTFHeader {
   versionMajor: number;
@@ -133,9 +141,9 @@ function parseHeader(bytes: Uint8Array): VTFHeader {
     flags: view.getUint32(20, true),
     frames: Math.max(1, view.getUint16(24, true)),
     firstFrame: view.getUint16(26, true),
-    imageFormat: view.getInt32(52, true) as VTFImageFormat,
+    imageFormat: toImageFormat(view.getInt32(52, true)),
     mipmapCount: Math.max(1, bytes[56]),
-    lowResImageFormat: view.getInt32(57, true) as VTFImageFormat,
+    lowResImageFormat: toImageFormat(view.getInt32(57, true)),
     lowResWidth: bytes[61],
     lowResHeight: bytes[62],
     depth,
@@ -261,6 +269,10 @@ function unpack565(value: number): [number, number, number] {
   return [r, g, b];
 }
 
+function scaleBits(value: number, max: number): number {
+  return Math.round((value * 255) / max);
+}
+
 function writePixel(
   out: Uint8ClampedArray,
   width: number,
@@ -307,15 +319,14 @@ function decodeDxt1(
         [0, 0, 0, 255],
       ];
 
-      const useTransparent = oneBitAlpha && color0 <= color1;
-      if (useTransparent) {
+      if (color0 <= color1) {
         palette[2] = [
           Math.round((c0[0] + c1[0]) / 2),
           Math.round((c0[1] + c1[1]) / 2),
           Math.round((c0[2] + c1[2]) / 2),
           255,
         ];
-        palette[3] = [0, 0, 0, 0];
+        palette[3] = [0, 0, 0, oneBitAlpha ? 0 : 255];
       } else {
         palette[2] = [
           Math.round((2 * c0[0] + c1[0]) / 3),
@@ -408,7 +419,7 @@ function decodeDxt3(data: Uint8Array, width: number, height: number): Uint8Clamp
   return out;
 }
 
-function decodeDxt5AlphaBlock(block: Uint8Array, blockOffset: number): Uint8Array {
+function decodeDxt5AlphaBlock(block: Uint8Array, blockOffset: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(16);
   const alpha0 = block[blockOffset];
   const alpha1 = block[blockOffset + 1];
@@ -610,57 +621,36 @@ function decodeUncompressed(
       }
       case VTF_IMAGE_FORMAT.RGB565: {
         const packed = view.getUint16(inOffset2, true);
-        const [r, g, b] = unpack565(packed);
-        out[outOffset] = r;
-        out[outOffset + 1] = g;
-        out[outOffset + 2] = b;
+        out[outOffset] = scaleBits(packed & 0x1f, 31);
+        out[outOffset + 1] = scaleBits((packed >> 5) & 0x3f, 63);
+        out[outOffset + 2] = scaleBits((packed >> 11) & 0x1f, 31);
         out[outOffset + 3] = 255;
         break;
       }
       case VTF_IMAGE_FORMAT.BGR565: {
         const packed = view.getUint16(inOffset2, true);
-        const b = Math.round((((packed >> 11) & 0x1f) * 255) / 31);
-        const g = Math.round((((packed >> 5) & 0x3f) * 255) / 63);
-        const r = Math.round(((packed & 0x1f) * 255) / 31);
-        out[outOffset] = r;
-        out[outOffset + 1] = g;
-        out[outOffset + 2] = b;
+        out[outOffset] = scaleBits((packed >> 11) & 0x1f, 31);
+        out[outOffset + 1] = scaleBits((packed >> 5) & 0x3f, 63);
+        out[outOffset + 2] = scaleBits(packed & 0x1f, 31);
         out[outOffset + 3] = 255;
         break;
       }
-      case VTF_IMAGE_FORMAT.BGRX5551: {
-        const packed = view.getUint16(inOffset2, true);
-        const b = Math.round((((packed >> 11) & 0x1f) * 255) / 31);
-        const g = Math.round((((packed >> 6) & 0x1f) * 255) / 31);
-        const r = Math.round((((packed >> 1) & 0x1f) * 255) / 31);
-        out[outOffset] = r;
-        out[outOffset + 1] = g;
-        out[outOffset + 2] = b;
-        out[outOffset + 3] = 255;
-        break;
-      }
+      case VTF_IMAGE_FORMAT.BGRX5551:
       case VTF_IMAGE_FORMAT.BGRA5551: {
         const packed = view.getUint16(inOffset2, true);
-        const b = Math.round((((packed >> 11) & 0x1f) * 255) / 31);
-        const g = Math.round((((packed >> 6) & 0x1f) * 255) / 31);
-        const r = Math.round((((packed >> 1) & 0x1f) * 255) / 31);
-        const a = packed & 0x1 ? 255 : 0;
-        out[outOffset] = r;
-        out[outOffset + 1] = g;
-        out[outOffset + 2] = b;
-        out[outOffset + 3] = a;
+        out[outOffset] = scaleBits((packed >> 10) & 0x1f, 31);
+        out[outOffset + 1] = scaleBits((packed >> 5) & 0x1f, 31);
+        out[outOffset + 2] = scaleBits(packed & 0x1f, 31);
+        out[outOffset + 3] =
+          format === VTF_IMAGE_FORMAT.BGRA5551 ? (packed & 0x8000 ? 255 : 0) : 255;
         break;
       }
       case VTF_IMAGE_FORMAT.BGRA4444: {
         const packed = view.getUint16(inOffset2, true);
-        const b = ((packed >> 12) & 0x0f) * 17;
-        const g = ((packed >> 8) & 0x0f) * 17;
-        const r = ((packed >> 4) & 0x0f) * 17;
-        const a = (packed & 0x0f) * 17;
-        out[outOffset] = r;
-        out[outOffset + 1] = g;
-        out[outOffset + 2] = b;
-        out[outOffset + 3] = a;
+        out[outOffset] = ((packed >> 8) & 0x0f) * 17;
+        out[outOffset + 1] = ((packed >> 4) & 0x0f) * 17;
+        out[outOffset + 2] = (packed & 0x0f) * 17;
+        out[outOffset + 3] = ((packed >> 12) & 0x0f) * 17;
         break;
       }
       case VTF_IMAGE_FORMAT.I8: {
@@ -792,34 +782,19 @@ function decodeVTF(bytes: Uint8Array): DecodedImage {
 }
 
 class vtfHandler implements FormatHandler {
-  public name: string = "vtf";
-
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "Valve Texture Format",
-      format: "vtf",
-      extension: "vtf",
-      mime: "image/x-vtf",
-      from: true,
-      to: false,
-      internal: "vtf",
-      category: Category.IMAGE,
-      lossless: false,
-    },
-    CommonFormats.PNG.supported("png", false, true, true),
-    CommonFormats.JPEG.supported("jpeg", false, true),
-    CommonFormats.WEBP.supported("webp", false, true),
+  public readonly name = "vtf";
+  public supportedFormats = [
+    Formats.VTF.builder("vtf").from(),
+    Formats.PNG.builder("png").lossless().to(),
+    Formats.JPEG.builder("jpeg").to(),
+    Formats.WEBP.builder("webp").to(),
   ];
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.#canvas = new OffscreenCanvas(1, 1);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas();
     this.ready = true;
   }
 
@@ -828,23 +803,23 @@ class vtfHandler implements FormatHandler {
     _inputFormat: FileFormat,
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
-    if (!this.#canvas || !this.#ctx) throw new InitializationError("Handler not initialized.");
+    if (!this.#bundle) throw new InitializationError("Handler not initialized.");
+    const { canvas, ctx } = this.#bundle;
 
     const outputFiles: FileData[] = [];
     for (const inputFile of inputFiles) {
       const decoded = decodeVTF(inputFile.bytes);
-      this.#canvas.width = decoded.width;
-      this.#canvas.height = decoded.height;
+      canvas.width = decoded.width;
+      canvas.height = decoded.height;
       const imageData = new ImageData(
         new Uint8ClampedArray(decoded.pixels),
         decoded.width,
         decoded.height,
       );
-      this.#ctx.putImageData(imageData, 0, 0);
+      ctx.putImageData(imageData, 0, 0);
 
-      const blob = await this.#canvas.convertToBlob({ type: outputFormat.mime });
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const name = inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+      const bytes = await canvasToBlob(this.#bundle, outputFormat.mime);
+      const name = changeExt(inputFile.name, outputFormat.extension);
       outputFiles.push({ bytes, name });
     }
     return outputFiles;

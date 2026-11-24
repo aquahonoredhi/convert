@@ -1,26 +1,17 @@
-import { FormatDefinition } from "../FormatHandler.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { BSON } from "bson";
+import { changeExt, decode, encode, ownedBytes } from "src/common/index.ts";
 
-const bsonFormat = new FormatDefinition(
-  "Binary JSON",
-  "bson",
-  "bson",
-  "application/bson",
-  Category.DATA,
-);
+const ARRAY_ROOT_KEY = "$convertArrayRoot";
 
 class bsonHandler implements FormatHandler {
-  public name: string = "bson";
-
-  public supportedFormats?: FileFormat[] = [
-    CommonFormats.JSON.supported("json", true, true, true),
-    bsonFormat.supported("bson", true, true, true),
+  public readonly name = "bson";
+  public supportedFormats = [
+    Formats.JSON.builder("json").lossless().fromTo(),
+    Formats.BSON.builder("bson").lossless().fromTo(),
   ];
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -32,43 +23,48 @@ class bsonHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     switch (inputFormat.mime) {
-      case CommonFormats.JSON.mime:
-        if (outputFormat.mime !== bsonFormat.mime) {
+      case Formats.JSON.mime:
+        if (outputFormat.mime !== Formats.BSON.mime) {
           throw new TypeError(`Unsupported output format: ${outputFormat.internal}`);
         }
 
         return inputFiles.map((file) => {
-          const text = new TextDecoder().decode(file.bytes);
+          const text = decode(file.bytes);
           let jsonData = JSON.parse(text);
 
           // BSON required the root to be an object.
           if (Array.isArray(jsonData)) {
-            jsonData = { root: jsonData };
+            jsonData = { [ARRAY_ROOT_KEY]: jsonData };
           }
 
           const bsonResult = BSON.serialize(jsonData);
-          const name = file.name.split(".").slice(0, -1).join(".") + ".bson";
+          const name = changeExt(file.name, "bson");
 
           return {
             name,
-            bytes: bsonResult,
+            bytes: ownedBytes(bsonResult),
           };
         });
 
-      case bsonFormat.mime:
-        if (outputFormat.mime !== CommonFormats.JSON.mime) {
+      case Formats.BSON.mime:
+        if (outputFormat.mime !== Formats.JSON.mime) {
           throw new TypeError(`Unsupported output format: ${outputFormat.internal}`);
         }
 
         return inputFiles.map((file) => {
           const bsonData = BSON.deserialize(file.bytes);
-          const text = JSON.stringify(bsonData);
+          const keys = Object.keys(bsonData);
+          const isWrappedArray =
+            keys.length === 1 &&
+            keys[0] === ARRAY_ROOT_KEY &&
+            Array.isArray(bsonData[ARRAY_ROOT_KEY]);
+          const text = JSON.stringify(isWrappedArray ? bsonData[ARRAY_ROOT_KEY] : bsonData);
 
-          const name = file.name.split(".").slice(0, -1).join(".") + ".json";
+          const name = changeExt(file.name, "json");
 
           return {
             name,
-            bytes: new TextEncoder().encode(text),
+            bytes: encode(text),
           };
         });
 

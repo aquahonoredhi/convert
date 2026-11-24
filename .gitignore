@@ -1,9 +1,10 @@
-bun.lock
 package-lock.json
 node_modules
 .cache
-public/material-file-icons
+public/icons.json
 start.sh
 dist
 release
 cache.json
+built
+dist-electron

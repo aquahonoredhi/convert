@@ -1,40 +1,27 @@
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
 
 import { QOIDecoder, QOIEncoder } from "qoi-fu";
 
 import { InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { blobToCanvas, canvasToBlob, createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 class qoiFuHandler implements FormatHandler {
-  public name: string = "qoiFu";
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PNG.supported("png", true, true, true),
-    CommonFormats.JPEG.supported("jpeg", true, true),
-    CommonFormats.WEBP.supported("webp", true, true),
-    CommonFormats.GIF.supported("gif", true, false),
-    {
-      name: "Quite OK Image",
-      format: "qoi",
-      extension: "qoi",
-      mime: "image/x-qoi",
-      from: true,
-      to: true,
-      internal: "qoi",
-      category: Category.IMAGE,
-      lossless: true,
-    },
+  public readonly name = "qoiFu";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().fromTo(),
+    Formats.JPEG.builder("jpeg").fromTo(),
+    Formats.WEBP.builder("webp").fromTo(),
+    Formats.GIF.builder("gif").from(),
+    Formats.QOI.builder("qoi").lossless().fromTo(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.#canvas = new OffscreenCanvas(1, 1);
-    const ctx = this.#canvas.getContext("2d");
-    if (!ctx) throw new InitializationError("Failed to create 2D rendering context.");
-    this.#ctx = ctx;
+    this.#bundle = createCanvas();
     this.ready = true;
   }
 
@@ -54,7 +41,7 @@ class qoiFuHandler implements FormatHandler {
 
     return argb;
   }
-  static argbToRgba(argb: Int32Array): Uint8ClampedArray {
+  static argbToRgba(argb: Int32Array): Uint8ClampedArray<ArrayBuffer> {
     const rgba = new Uint8ClampedArray(argb.length * 4);
 
     for (let i = 0; i < argb.length; i++) {
@@ -75,9 +62,10 @@ class qoiFuHandler implements FormatHandler {
     inputFormat: FileFormat,
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
-    if (!this.#canvas || !this.#ctx) {
+    if (!this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { canvas, ctx } = this.#bundle;
 
     const outputFiles: FileData[] = [];
 
@@ -92,19 +80,12 @@ class qoiFuHandler implements FormatHandler {
 
     if (outputIsQOI) {
       for (const inputFile of inputFiles) {
-        this.#ctx.clearRect(0, 0, this.#canvas.width, this.#canvas.width);
+        await blobToCanvas(this.#bundle, inputFile.bytes, inputFormat.mime);
 
-        const blob = new Blob([inputFile.bytes as BlobPart], { type: inputFormat.mime });
-        const image = await createImageBitmap(blob);
+        const width = canvas.width;
+        const height = canvas.height;
 
-        const width = image.width;
-        const height = image.height;
-
-        this.#canvas.width = width;
-        this.#canvas.height = height;
-        this.#ctx.drawImage(image, 0, 0);
-
-        const imageData = this.#ctx.getImageData(0, 0, width, height);
+        const imageData = ctx.getImageData(0, 0, width, height);
         const pixelBuffer = qoiFuHandler.rgbaToArgb(imageData.data);
 
         const qoiEncoder = new QOIEncoder();
@@ -114,8 +95,7 @@ class qoiFuHandler implements FormatHandler {
         const bytesSize = qoiEncoder.getEncodedSize();
         const bytes = new Uint8Array(qoiEncoder.getEncoded().slice(0, bytesSize));
 
-        const name =
-          inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+        const name = changeExt(inputFile.name, outputFormat.extension);
         outputFiles.push({ bytes, name });
       }
     } else {
@@ -126,23 +106,19 @@ class qoiFuHandler implements FormatHandler {
 
         const width = qoiDecoder.getWidth();
         const height = qoiDecoder.getHeight();
-        const colorSpace = qoiDecoder.isLinearColorspace() ? "display-p3" : "srgb";
+        const colorSpace = "srgb";
         const pixelBuffer = qoiFuHandler.argbToRgba(qoiDecoder.getPixels());
 
-        const imageData = new ImageData(pixelBuffer as ImageDataArray, width, height, {
+        const imageData = new ImageData(pixelBuffer, width, height, {
           colorSpace: colorSpace,
         });
 
-        this.#canvas.width = width;
-        this.#canvas.height = height;
-        this.#ctx.putImageData(imageData, 0, 0);
+        canvas.width = width;
+        canvas.height = height;
+        ctx.putImageData(imageData, 0, 0);
 
-        const blob = await this.#canvas.convertToBlob({
-          type: outputFormat.mime,
-        });
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const name =
-          inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+        const bytes = await canvasToBlob(this.#bundle, outputFormat.mime);
+        const name = changeExt(inputFile.name, outputFormat.extension);
         outputFiles.push({ bytes, name });
       }
     }

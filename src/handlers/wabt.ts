@@ -1,62 +1,38 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import { Category } from "../CommonFormats.ts";
+import Formats from "../Formats.ts";
 import wabt from "wabt";
+import { changeExt, encode, ownedBytes } from "src/common/index.ts";
 
 // WabtModule is not exported
 type WabtModule = Awaited<ReturnType<typeof wabt>>;
 
 export default class wabtHandler implements FormatHandler {
-  public name: string = "wabt";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "wabt";
+  public supportedFormats = [
+    Formats.WASM.builder("wasm").lossless().fromTo(),
+    Formats.WAT.builder("wat").lossless().fromTo(),
+  ];
+  public ready = false;
 
   private wabtModule?: WabtModule;
 
-  wasm2wat(bytes: Uint8Array): Uint8Array {
+  wasm2wat(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
     const wasmModule = this.wabtModule!.readWasm(bytes, {});
     const str = wasmModule.toText({});
-    const encoder = new TextEncoder();
-    const encoded = encoder.encode(str);
+    const encoded = encode(str);
     wasmModule.destroy();
     return encoded;
   }
 
-  wat2wasm(filename: string, bytes: Uint8Array): Uint8Array {
+  wat2wasm(filename: string, bytes: Uint8Array): Uint8Array<ArrayBuffer> {
     const wasmModule = this.wabtModule!.parseWat(filename, bytes);
     const outBytes = wasmModule.toBinary({});
-    const buffer = outBytes.buffer;
+    const buffer = ownedBytes(outBytes.buffer);
     wasmModule.destroy();
     return buffer;
   }
 
   async init() {
-    this.supportedFormats = [
-      {
-        name: "WebAssembly Binary (Wasm)",
-        format: "wasm",
-        extension: "wasm",
-        mime: "application/wasm",
-        from: true,
-        to: true,
-        internal: "wasm",
-        category: Category.CODE,
-        lossless: true,
-      },
-      {
-        name: "WebAssembly Text Format (WAT)",
-        format: "wat",
-        extension: "wat",
-        // https://github.com/WebAssembly/spec/issues/1347
-        mime: "text/plain",
-        from: true,
-        to: true,
-        internal: "wat",
-        category: Category.CODE,
-        lossless: true,
-      },
-    ];
-
     this.wabtModule = await wabt();
 
     this.ready = true;
@@ -72,7 +48,7 @@ export default class wabtHandler implements FormatHandler {
     if (inputFormat.internal == "wasm" && outputFormat.internal == "wat") {
       for (const file of inputFiles) {
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + `.${outputFormat.extension}`,
+          name: changeExt(file.name, outputFormat.extension),
           bytes: this.wasm2wat(file.bytes),
         });
       }
@@ -82,7 +58,7 @@ export default class wabtHandler implements FormatHandler {
     if (inputFormat.internal == "wat" && outputFormat.internal == "wasm") {
       for (const file of inputFiles) {
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + `.${outputFormat.extension}`,
+          name: changeExt(file.name, outputFormat.extension),
           bytes: this.wat2wasm(file.name, file.bytes),
         });
       }

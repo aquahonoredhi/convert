@@ -1,25 +1,15 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { WASI, File, OpenFile, ConsoleStdout } from "@bjorn3/browser_wasi_shim";
+import { changeExt } from "src/common/index.ts";
 
 class wasiRunnerHandler implements FormatHandler {
-  public name: string = "wasiRunner";
-  public supportedFormats: FileFormat[] = [
-    {
-      name: "WebAssembly Binary (Wasm)",
-      format: "wasm",
-      extension: "wasm",
-      mime: "application/wasm",
-      from: true,
-      to: false,
-      internal: "wasm",
-      category: Category.CODE,
-      lossless: true,
-    },
-    CommonFormats.TEXT.builder("txt").allowTo(),
+  public readonly name = "wasiRunner";
+  public supportedFormats = [
+    Formats.WASM.builder("wasm").lossless().from(),
+    Formats.TEXT.builder("txt").to(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -41,13 +31,17 @@ class wasiRunnerHandler implements FormatHandler {
       let wasi = new WASI([inputFile.name], [], fds);
 
       let wasm = await WebAssembly.compile(new Uint8Array(inputFile.bytes));
-      let inst = (await WebAssembly.instantiate(wasm, {
+      const { exports } = await WebAssembly.instantiate(wasm, {
         wasi_snapshot_preview1: wasi.wasiImport,
-      })) as any;
-      wasi.start(inst);
+      });
+      const { memory, _start: start } = exports;
+      if (!(memory instanceof WebAssembly.Memory) || typeof start !== "function") {
+        throw new Error("Not a WASI command module: it needs to export memory and _start.");
+      }
+      wasi.start({ exports: { memory, _start: () => start() } });
 
       outputFiles.push({
-        name: inputFile.name.replace(/\.[^.]+$/, "") + `.txt`,
+        name: changeExt(inputFile.name, "txt"),
         bytes: new Uint8Array(output),
       });
     }

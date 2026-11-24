@@ -1,6 +1,7 @@
 import type { FileFormat, FileData, FormatHandler } from "../FormatHandler.js";
-import CommonFormats from "src/CommonFormats.js";
+import Formats from "src/Formats.js";
 import { Buffer } from "buffer";
+import { encode, stripExt } from "src/common/index.ts";
 
 // Toggle logging for debugging EXE to BAT conversion
 const DEBUG_EXE_TO_BAT = false;
@@ -8,14 +9,12 @@ const DEBUG_EXE_TO_BAT = false;
 const EXE_MIME = "application/vnd.microsoft.portable-executable";
 
 export default class exeToBatHandler implements FormatHandler {
-  name = "exeToBat";
-  supportedFormats: FileFormat[] = [
-    CommonFormats.EXE.builder("exe").allowFrom(),
-    CommonFormats.BATCH.builder("bat").allowTo().markLossless(),
+  public readonly name = "exeToBat";
+  public supportedFormats = [
+    Formats.EXE.builder("exe").from(),
+    Formats.BATCH.builder("bat").lossless().to(),
   ];
-
-  ready = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     if (DEBUG_EXE_TO_BAT) console.log("[exe2bat] Initializing handler...");
@@ -36,14 +35,9 @@ export default class exeToBatHandler implements FormatHandler {
       console.log("[exe2bat] Input files:", inputFiles.length);
     }
 
-    if (inputFormat.mime !== EXE_MIME || outputFormat.mime !== CommonFormats.BATCH.mime) {
+    if (inputFormat.mime !== EXE_MIME || outputFormat.mime !== Formats.BATCH.mime) {
       if (DEBUG_EXE_TO_BAT)
-        console.log(
-          "[exe2bat] MIME type mismatch - expected:",
-          EXE_MIME,
-          "→",
-          CommonFormats.BATCH.mime,
-        );
+        console.log("[exe2bat] MIME type mismatch - expected:", EXE_MIME, "→", Formats.BATCH.mime);
       throw new TypeError("This handler only supports EXE to BAT conversion");
     }
 
@@ -58,7 +52,7 @@ export default class exeToBatHandler implements FormatHandler {
   }
 
   private async convertExeToBat(file: FileData): Promise<FileData> {
-    const exeName = file.name.replace(/\.[^.]*$/, "");
+    const exeName = stripExt(file.name);
     const batName = `${exeName}.bat`;
 
     if (DEBUG_EXE_TO_BAT) {
@@ -84,9 +78,9 @@ export default class exeToBatHandler implements FormatHandler {
     }
 
     // Create buffer safely with error handling
-    let batBytes: Uint8Array;
+    let batBytes: Uint8Array<ArrayBuffer>;
     try {
-      batBytes = new TextEncoder().encode(batContent);
+      batBytes = encode(batContent);
       if (DEBUG_EXE_TO_BAT) {
         console.log("[exe2bat] Successfully encoded batch content");
       }
@@ -108,8 +102,9 @@ setlocal
 :: Auto-generated EXE-embedded batch
 :: Reconstructs and runs ${exeName}
 
-set "outExe=%TEMP%\\${exeName}.exe"
+set "outExe=%TEMP%\\${exeName.replaceAll("%", "%%")}.exe"
 set "b64file=%TEMP%\\payload.b64"
+set "selfBat=%~f0"
 
 echo Extracting payload to %b64file%...
 
@@ -118,7 +113,8 @@ if exist "%b64file%" del "%b64file%"
 if exist "%outExe%" del "%outExe%"
 
 :: Fast extraction using PowerShell
-powershell -NoProfile -Command "$lines = Get-Content '%~f0'; $start = $lines.IndexOf('-----BEGIN PAYLOAD-----') + 1; $end = $lines.IndexOf('-----END PAYLOAD-----'); $payload = $lines[$start..($end-1)]; Set-Content -LiteralPath '%b64file%' -Value $payload -Encoding ASCII"
+:: Paths go through the environment, so quotes in them cannot break the PowerShell command
+powershell -NoProfile -Command "$lines = Get-Content -LiteralPath $env:selfBat; $start = $lines.IndexOf('-----BEGIN PAYLOAD-----') + 1; $end = $lines.IndexOf('-----END PAYLOAD-----'); $payload = $lines[$start..($end-1)]; Set-Content -LiteralPath $env:b64file -Value $payload -Encoding ASCII"
 
 :: Debug: Check if payload was extracted
 if exist "%b64file%" (
@@ -159,6 +155,4 @@ exit /b 0
 ${payload}
 -----END PAYLOAD-----`;
   }
-
-  supportAnyInput = false;
 }

@@ -1,29 +1,46 @@
 import { useEffect, useState } from "preact/hooks";
+import iconsUrl from "built/material-icons/icons.json?url";
+import type { CategoryType } from "src/Formats";
 import { getDefaultIconForCategory } from "./categoryDefaultIcons";
 import "./index.css";
+import { isStringRecord } from "src/common/index.ts";
 
 interface FileIconProps {
   extension?: string;
   mimeType?: string;
-  category?: string | string[];
+  category?: CategoryType | CategoryType[];
   size?: number;
   className?: string;
 }
 
-let mapCache: Record<string, string> | null = null;
-let loadPromise: Promise<Record<string, string>> | null = null;
+interface IconBundle {
+  extensions: Record<string, string>;
+  icons: Record<string, string>;
+}
 
-function loadExtensionMap(): Promise<Record<string, string>> {
-  if (mapCache) return Promise.resolve(mapCache);
+const isIconBundle = (value: unknown): value is IconBundle =>
+  typeof value === "object" &&
+  value !== null &&
+  "extensions" in value &&
+  "icons" in value &&
+  isStringRecord(value.extensions) &&
+  isStringRecord(value.icons);
+
+let bundleCache: IconBundle | null = null;
+let loadPromise: Promise<IconBundle> | null = null;
+
+function loadIconBundle(): Promise<IconBundle> {
+  if (bundleCache) return Promise.resolve(bundleCache);
   if (!loadPromise) {
-    loadPromise = fetch(`${import.meta.env.BASE_URL}material-file-icons/extension-map.json`)
+    loadPromise = fetch(iconsUrl)
       .then((r) => {
-        if (!r.ok) throw new Error("extension-map load failed");
-        return r.json() as Promise<Record<string, string>>;
+        if (!r.ok) throw new Error("icon bundle load failed");
+        return r.json();
       })
-      .then((m) => {
-        mapCache = m;
-        return m;
+      .then((bundle: unknown) => {
+        if (!isIconBundle(bundle)) throw new Error("icon bundle is malformed");
+        bundleCache = bundle;
+        return bundle;
       });
   }
   return loadPromise;
@@ -64,7 +81,7 @@ function resolveLogical(
   extension: string | undefined,
   mimeType: string | undefined,
   map: Record<string, string> | null,
-  category: string | string[] | undefined,
+  category: CategoryType | CategoryType[] | undefined,
 ): string {
   let logical = "file";
   if (extension !== undefined && extension !== "") {
@@ -85,19 +102,22 @@ export default function FileIcon({
   size = 20,
   className = "",
 }: FileIconProps) {
-  const [map, setMap] = useState<Record<string, string> | null>(mapCache);
+  const [bundle, setBundle] = useState<IconBundle | null>(bundleCache);
 
   useEffect(() => {
-    loadExtensionMap().then(setMap);
+    loadIconBundle().then(setBundle, console.error);
   }, []);
 
-  const logical = resolveLogical(extension, mimeType, map, category);
-
-  const src = `${import.meta.env.BASE_URL}material-file-icons/icons/${logical}.svg`;
+  const logical = resolveLogical(extension, mimeType, bundle?.extensions ?? null, category);
+  const svg = bundle?.icons[logical] ?? bundle?.icons.file;
 
   return (
-    <div className={`file-icon ${className}`} style={{ width: size, height: size }}>
-      <img src={src} alt="" width={size} height={size} decoding="async" />
-    </div>
+    <div
+      className={`file-icon ${className}`}
+      style={{ width: size, height: size }}
+      aria-hidden="true"
+      // this is safe cuz it comes from the server
+      dangerouslySetInnerHTML={{ __html: svg ?? "" }}
+    />
   );
 }

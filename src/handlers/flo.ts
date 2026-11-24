@@ -1,42 +1,21 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import normalizeMimeType from "../normalizeMimeType.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import initReflo, { decode, encode, get_flo_file_info } from "@flo-audio/reflo";
-import { WaveFile } from "wavefile";
+import refloWasmUrl from "@flo-audio/reflo/reflo_bg.wasm?url";
+import { changeExt, ownedBytes } from "src/common/index.ts";
+import { typedWaveFile } from "src/common/wav.ts";
 
 class floHandler implements FormatHandler {
-  public name: string = "flo";
-  public supportedFormats: FileFormat[] = [];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "flo";
+  public supportedFormats = [
+    Formats.FLO.builder("flo").fromTo(),
+    Formats.WAV.builder("wav").lossless().fromTo(),
+    Formats.F32LE.builder("f32le").lossless().fromTo(),
+  ];
+  public ready = false;
 
   async init() {
-    await initReflo({ module_or_path: "/convert/wasm/reflo_bg.wasm" });
-    this.supportedFormats = [
-      {
-        name: "Flo Audio",
-        format: "flo",
-        extension: "flo",
-        mime: normalizeMimeType("audio/flo"),
-        from: true,
-        to: true,
-        internal: "flo",
-        category: Category.AUDIO,
-        lossless: false,
-      },
-      CommonFormats.WAV.builder("wav").allowFrom().allowTo().markLossless(),
-      {
-        name: "Raw PCM Float32LE",
-        format: "f32le",
-        extension: "pcm",
-        mime: normalizeMimeType("video/f32le"),
-        from: true,
-        to: true,
-        internal: "f32le",
-        category: Category.AUDIO,
-        lossless: true,
-      },
-    ];
+    await initReflo({ module_or_path: refloWasmUrl });
     this.ready = true;
   }
 
@@ -48,8 +27,6 @@ class floHandler implements FormatHandler {
     if (!inputFiles.length) throw new RangeError("No input files.");
 
     return inputFiles.map((file) => {
-      const idx = file.name.lastIndexOf(".");
-      const baseName = idx > 0 ? file.name.slice(0, idx) : file.name;
       let samples: Float32Array;
       let sampleRate: number;
       let channels: number;
@@ -61,12 +38,11 @@ class floHandler implements FormatHandler {
         channels = info.channels;
         info.free();
       } else if (inputFormat.internal === "wav") {
-        const wav = new WaveFile(file.bytes);
+        const wav = typedWaveFile(file.bytes);
         wav.toBitDepth("32f");
-        samples = new Float32Array(wav.getSamples(true, Float32Array));
-        const fmt = wav.fmt as { sampleRate: number; numChannels: number };
-        sampleRate = fmt.sampleRate;
-        channels = fmt.numChannels;
+        samples = wav.getSamples(true, Float32Array);
+        sampleRate = wav.fmt.sampleRate;
+        channels = wav.fmt.numChannels;
       } else if (inputFormat.internal === "f32le") {
         if (file.bytes.length % 4 !== 0) {
           throw new RangeError("Raw Float32LE PCM must contain whole 4-byte samples.");
@@ -83,17 +59,20 @@ class floHandler implements FormatHandler {
       }
 
       if (outputFormat.internal === "flo") {
-        return { bytes: encode(samples, sampleRate, channels, 32, null), name: baseName + ".flo" };
+        return {
+          bytes: ownedBytes(encode(samples, sampleRate, channels, 32, null)),
+          name: changeExt(file.name, "flo"),
+        };
       } else if (outputFormat.internal === "wav") {
-        const wav = new WaveFile();
+        const wav = typedWaveFile();
         wav.fromScratch(channels, sampleRate, "32f", samples);
         wav.toBitDepth("16");
-        return { bytes: wav.toBuffer(), name: baseName + ".wav" };
+        return { bytes: ownedBytes(wav.toBuffer()), name: changeExt(file.name, "wav") };
       } else if (outputFormat.internal === "f32le") {
         const bytes = new Uint8Array(samples.length * 4);
         const view = new DataView(bytes.buffer);
         for (let i = 0; i < samples.length; i++) view.setFloat32(i * 4, samples[i], true);
-        return { bytes, name: baseName + ".pcm" };
+        return { bytes, name: changeExt(file.name, outputFormat.extension) };
       } else {
         throw new TypeError(
           `floHandler: unsupported conversion ${inputFormat.format} -> ${outputFormat.format}`,

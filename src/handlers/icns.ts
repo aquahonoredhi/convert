@@ -1,16 +1,11 @@
-import CommonFormats from "src/CommonFormats.ts";
-import {
-  FormatDefinition,
-  type FileData,
-  type FileFormat,
-  type FormatHandler,
-} from "../FormatHandler.ts";
+import Formats from "src/Formats.ts";
+import { type FileData, type FileFormat, type FormatHandler } from "../FormatHandler.ts";
 import { BadMagicError, InitializationError } from "src/errors.ts";
+import { changeExt } from "src/common/index.ts";
+import { canvasToBlob, createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 const ICNS_MAGIC = "icns";
-const ICNS_FORMAT = new FormatDefinition("Apple Icon Image", "icns", "icns", "image/icns", "image");
-
 const ICON_SIZES = [16, 32, 64, 128, 256, 512, 1024];
 
 const ICON_TYPE_BY_SIZE = new Map<number, string>([
@@ -23,9 +18,14 @@ const ICON_TYPE_BY_SIZE = new Map<number, string>([
   [1024, "ic10"],
 ]);
 
-const ICON_SIZE_BY_TYPE = new Map<string, number>(
-  Array.from(ICON_TYPE_BY_SIZE.entries()).map(([size, type]) => [type, size]),
-);
+const ICON_SIZE_BY_TYPE = new Map<string, number>([
+  ...ICON_TYPE_BY_SIZE.entries().map(([size, type]) => [type, size] as const),
+  // Retina (@2x) variants, by pixel size
+  ["ic11", 32],
+  ["ic12", 64],
+  ["ic13", 256],
+  ["ic14", 512],
+]);
 
 function isPng(bytes: Uint8Array): boolean {
   if (bytes.length < PNG_SIGNATURE.length) return false;
@@ -77,10 +77,10 @@ export function resolveLargestIconSize(maxDimension: number): number {
   for (const size of ICON_SIZES) {
     if (normalized <= size) return size;
   }
-  return ICON_SIZES[ICON_SIZES.length - 1];
+  return ICON_SIZES.at(-1)!;
 }
 
-export function extractBestPngFromIcns(icnsBytes: Uint8Array): Uint8Array {
+export function extractBestPngFromIcns(icnsBytes: Uint8Array): Uint8Array<ArrayBuffer> {
   if (icnsBytes.length < 8) throw new RangeError("Input is too small for an ICNS file.");
   if (readFourCC(icnsBytes, 0) !== ICNS_MAGIC)
     throw new BadMagicError(`Invalid ICNS signature: ${readFourCC(icnsBytes, 0)}`);
@@ -89,7 +89,7 @@ export function extractBestPngFromIcns(icnsBytes: Uint8Array): Uint8Array {
   const endOffset = Math.min(icnsBytes.length, declaredLength);
   if (declaredLength < 8) throw new RangeError(`Invalid ICNS length: ${declaredLength}`);
 
-  let bestPng: Uint8Array | null = null;
+  let bestPng: Uint8Array<ArrayBuffer> | null = null;
   let bestSize = 0;
   let offset = 8;
 
@@ -124,50 +124,41 @@ export function extractBestPngFromIcns(icnsBytes: Uint8Array): Uint8Array {
 }
 
 class icnsHandler implements FormatHandler {
-  public name: string = "icns";
-  public ready: boolean = false;
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PNG.supported("png", true, true, true),
-    ICNS_FORMAT.builder("icns")
-      .allowFrom(true)
-      .allowTo(true)
-      // ICNS contains a finite icon set; conversions here are not guaranteed bit-exact round-trips.
-      .markLossless(false),
+  public readonly name = "icns";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().fromTo(),
+    // ICNS contains a finite icon set; conversions here are not guaranteed bit-exact round-trips.
+    Formats.ICNS.builder("icns").fromTo(),
   ];
-  public offload: boolean = true;
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.#canvas = new OffscreenCanvas(1, 1);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
-    if (!this.#ctx) throw new InitializationError("Failed to initialize canvas context.");
+    this.#bundle = createCanvas();
     this.ready = true;
   }
 
-  async #canvasToPngBytes(size: number, bitmap: ImageBitmap): Promise<Uint8Array> {
-    if (!this.#canvas || !this.#ctx) throw new InitializationError("Handler not initialized.");
+  async #canvasToPngBytes(size: number, bitmap: ImageBitmap): Promise<Uint8Array<ArrayBuffer>> {
+    if (!this.#bundle) throw new InitializationError("Handler not initialized.");
+    const { canvas, ctx } = this.#bundle;
 
-    this.#canvas.width = size;
-    this.#canvas.height = size;
-    this.#ctx.clearRect(0, 0, size, size);
-    this.#ctx.drawImage(bitmap, 0, 0, size, size);
+    canvas.width = size;
+    canvas.height = size;
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(bitmap, 0, 0, size, size);
 
-    const blob = await this.#canvas.convertToBlob({
-      type: "image/png",
-    });
-    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const bytes = await canvasToBlob(this.#bundle, "image/png");
 
     return bytes;
   }
 
-  async #encodeIcns(pngBytes: Uint8Array): Promise<Uint8Array> {
+  async #encodeIcns(pngBytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
     const dimensions = parsePngDimensions(pngBytes);
     const largestSize = resolveLargestIconSize(Math.max(dimensions.width, dimensions.height));
     const targetSizes = ICON_SIZES.filter((size) => size <= largestSize);
 
-    const bitmap = await createImageBitmap(new Blob([pngBytes as BlobPart], { type: "image/png" }));
+    const bitmap = await createImageBitmap(new Blob([pngBytes], { type: "image/png" }));
 
     const chunks: Array<{ type: string; bytes: Uint8Array }> = [];
     try {
@@ -209,8 +200,7 @@ class icnsHandler implements FormatHandler {
     const outputFiles: FileData[] = [];
 
     for (const inputFile of inputFiles) {
-      const baseName = inputFile.name.split(".").slice(0, -1).join(".");
-      let bytes: Uint8Array;
+      let bytes: Uint8Array<ArrayBuffer>;
 
       if (inputFormat.internal === "icns" && outputFormat.internal === "png") {
         bytes = extractBestPngFromIcns(inputFile.bytes);
@@ -224,7 +214,7 @@ class icnsHandler implements FormatHandler {
 
       outputFiles.push({
         bytes,
-        name: `${baseName}.${outputFormat.extension}`,
+        name: changeExt(inputFile.name, outputFormat.extension),
       });
     }
 

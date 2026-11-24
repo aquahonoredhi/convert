@@ -1,7 +1,6 @@
 import "./index.css";
 
 import { useState, useMemo, useCallback, useEffect, useRef } from "preact/hooks";
-import mime from "mime";
 import {
   ConversionOptions,
   SelectedFiles,
@@ -9,20 +8,34 @@ import {
   type ConversionOptionsMap,
 } from "src/main";
 import { Mode, ModeEnum } from "src/ui/ModeStore";
-import normalizeMimeType from "src/normalizeMimeType";
-import type { FileFormat } from "src/FormatHandler";
+import { getExt } from "src/common/index.ts";
+import { filePath } from "src/common/path.ts";
+import { formatIdentifier } from "src/FormatHandler";
+import { detectFormatMatches } from "src/detectFormat";
 
 import ConversionHeader from "src/ui/components/Conversion/ConversionHeader";
 import FormatExplorer from "src/ui/components/Conversion/FormatExplorer";
 import LoadingScreen from "src/ui/components/LoadingScreen";
 import Footer from "src/ui/components/Footer";
 import { ArrowLeft, ArrowRight, Plus } from "lucide-preact";
-import { PopupData } from "src/ui";
-import { openPopup } from "src/ui/PopupStore";
+import { PopupData } from "src/ui/AppState";
+import { openPopup, popupOpen } from "src/ui/PopupStore";
 import FileInfoBadge from "src/ui/components/FileInfo";
 import { ConversionInProgress, CurrentPage, Pages } from "src/ui/AppState";
 import { ProgressStore } from "src/ui/ProgressStore";
 import StyledButton, { ButtonVariant } from "src/ui/components/StyledButton";
+import SettingsPanel from "src/ui/components/Conversion/SettingsPanel";
+import {
+  SettingsPanelOpen,
+  applicableSettings,
+  availableSettings,
+} from "src/ui/ConversionSettingsStore";
+
+let previousSelection: {
+  fileExt: string;
+  from: ConversionOption;
+  to: ConversionOption;
+} | null = null;
 
 type ConversionStep = "select-from" | "select-to" | "converting";
 
@@ -43,7 +56,7 @@ function countAvailableFormats(
       continue;
     }
 
-    const dedupeKey = `${format.mime}|${format.format}`;
+    const dedupeKey = formatIdentifier(format);
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
     count += 1;
@@ -57,78 +70,26 @@ function getConversionOptions(): ConversionOptionsMap {
   throw new Error("Can't build format list!", { cause: "UI got empty global format list" });
 }
 
-function expandVideoContainerMimes(candidates: string[]): string[] {
-  const out = new Set(candidates);
-  for (const c of candidates) {
-    if (c === "video/mp4" || c === "video/quicktime") {
-      out.add("video/mp4");
-      out.add("video/quicktime");
-    }
-  }
-  return [...out];
+/** Input formats the first file could be, best match first. */
+function getMatchingFromFormats(options: ConversionOptionsMap, files: File[]) {
+  if (files.length === 0) return [];
+  const fromFormats = [...options.keys()].filter((format) => format.from);
+  return detectFormatMatches(files[0], fromFormats, { loose: true });
 }
 
-function getMimeCandidatesForFile(file: File): string[] {
-  const set = new Set<string>();
-  const raw = file.type?.trim();
-  if (raw) set.add(normalizeMimeType(raw));
-  const fromPath = mime.getType(file.name);
-  if (fromPath) set.add(normalizeMimeType(fromPath));
-  const extOnly = file.name.split(".").pop()?.toLowerCase();
-  if (extOnly) {
-    const fromExt = mime.getType(extOnly);
-    if (fromExt) set.add(normalizeMimeType(fromExt));
-  }
-  return expandVideoContainerMimes([...set]);
-}
-
-function formatMatchesUploadedFile(
-  format: FileFormat,
-  ext: string,
-  mimeCandidates: string[],
-): boolean {
-  if (mimeCandidates.some((m) => m === format.mime)) return true;
-  if (!ext) return false;
-  const e = ext.toLowerCase();
-  const fex = format.extension.toLowerCase();
-  const fmt = format.format.toLowerCase();
-  const intr = format.internal.toLowerCase();
-  return (
-    fex === e || fex.includes(e) || fmt === e || fmt.includes(e) || intr === e || intr.includes(e)
-  );
-}
-
-function getMatchingFromFormats(
-  options: ConversionOptionsMap,
-  files: File[],
-): ConversionOptionsMap {
-  if (files.length === 0) return options;
-
-  const file = files[0];
-  const mimeCandidates = getMimeCandidatesForFile(file);
-  const ext = file.name.split(".").pop()?.toLowerCase() || "";
-  const matched: ConversionOptionsMap = new Map();
-
-  for (const [format, handler] of options) {
-    if (!format.from) continue;
-    if (formatMatchesUploadedFile(format, ext, mimeCandidates)) {
-      matched.set(format, handler);
-    }
-  }
-
-  return matched.size > 0 ? matched : options;
-}
-
-function downloadFile(bytes: Uint8Array, name: string, type: string) {
-  const blob = new Blob([bytes as BlobPart], { type: type });
+function downloadFile(bytes: Uint8Array<ArrayBuffer>, name: string) {
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
+  link.href = url;
   link.download = name;
   link.click();
+  // we have to revoke it but not before the browser starts downloading (60s is conservative)
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function removeFile(key: string) {
-  const { [key as keyof typeof SelectedFiles.value]: _, ...rest } = SelectedFiles.value;
+  const rest = Object.fromEntries(Object.entries(SelectedFiles.value).filter(([k]) => k !== key));
   SelectedFiles.value = rest;
   if (Object.keys(rest).length === 0) CurrentPage.value = Pages.Upload;
 }
@@ -156,40 +117,36 @@ function addFiles(fileList: FileList | null | undefined) {
 }
 
 export default function Conversion() {
+  const actionRef = useRef<HTMLButtonElement>(null);
+  const filesRef = useRef<HTMLDivElement>(null);
+  const actionBarRef = useRef<HTMLDivElement>(null);
+  const addButtonRef = useRef<HTMLButtonElement>(null);
+  const previousStep = useRef<ConversionStep | null>(null);
   const allOptions = getConversionOptions();
-  const files = Object.values(SelectedFiles.value);
+  const files = useMemo(() => Object.values(SelectedFiles.value), [SelectedFiles.value]);
   const firstFile = files[0];
   const isAdvanced = Mode.value === ModeEnum.Advanced;
+  const fileExt = firstFile ? getExt(firstFile.name).toLowerCase() : null;
 
-  const matchingFrom = useMemo(
-    () => getMatchingFromFormats(allOptions, files),
-    [allOptions, files],
+  const fromMatches = useMemo(() => getMatchingFromFormats(allOptions, files), [allOptions, files]);
+
+  const matchingFrom = useMemo<ConversionOptionsMap>(
+    () => new Map(fromMatches.map(({ format }) => [format, allOptions.get(format)!])),
+    [fromMatches, allOptions],
   );
 
+  const matchingFromSet = useMemo(() => new Set(matchingFrom.keys()), [matchingFrom]);
+
   const autoSelectOption = useMemo<ConversionOption | null>(() => {
-    if (!matchingFrom.size) return null;
-    const isSimple = Mode.value === ModeEnum.Simple;
-    if (!isSimple) {
-      if (matchingFrom.size === 1) return matchingFrom.entries().next().value ?? null;
-      else return null;
-    }
+    if (!fromMatches.length) return null;
+    const first: ConversionOption = [fromMatches[0].format, allOptions.get(fromMatches[0].format)!];
+    if (Mode.value !== ModeEnum.Simple) return fromMatches.length === 1 ? first : null;
 
-    const mimeCandidates = getMimeCandidatesForFile(firstFile);
-    const ext = firstFile.name.split(".").pop()?.toLowerCase() || "";
-
-    const uniqueFormats = new Set<string>();
-    for (const [format, handler] of matchingFrom) {
-      uniqueFormats.add(`${format.mime}|${format.format}`);
-
-      // chances are, this format is exactly what the user wants
-      if (ext === format.extension && mimeCandidates.includes(format.mime)) {
-        return [format, handler];
-      }
-    }
-    if (uniqueFormats.size === 1) return matchingFrom.entries().next().value ?? null;
-
-    return null;
-  }, [matchingFrom, Mode.value, firstFile]);
+    // chances are, an exact extension + MIME match is what the user wants
+    if (fromMatches[0].match === "exact") return first;
+    const uniqueFormats = new Set(fromMatches.map(({ format }) => formatIdentifier(format)));
+    return uniqueFormats.size === 1 ? first : null;
+  }, [fromMatches, allOptions, Mode.value]);
 
   const [step, setStep] = useState<ConversionStep>(() => {
     if (autoSelectOption) return "select-to";
@@ -197,23 +154,58 @@ export default function Conversion() {
   });
 
   const [fromOption, setFromOption] = useState<ConversionOption | null>(autoSelectOption);
+  const [showAll, setShowAll] = useState(files.length === 0);
 
   const [toOption, setToOption] = useState<ConversionOption | null>(null);
   const [isConverting, setIsConverting] = useState(false);
 
+  const settingSpecs = useMemo(() => {
+    if (!toOption) return new Map();
+    if (isAdvanced) return availableSettings([toOption]);
+    const id = formatIdentifier(toOption[0]);
+    return availableSettings(
+      [...allOptions].filter(([f]) => f.to && formatIdentifier(f) === id),
+      true,
+    );
+  }, [toOption, isAdvanced, allOptions]);
+  const settings = applicableSettings(settingSpecs);
+
   useEffect(() => {
     if (!firstFile || isConverting) return;
 
-    if (autoSelectOption) {
+    const remembered = previousSelection;
+    const sameInput = remembered && remembered.fileExt === fileExt;
+
+    if (sameInput) {
+      setFromOption(remembered.from);
+      setToOption(remembered.to);
+      setStep("select-to");
+    } else if (autoSelectOption) {
       setFromOption(autoSelectOption);
+      setToOption(null);
       setStep("select-to");
     } else {
       setFromOption(null);
+      setToOption(null);
       setStep("select-from");
     }
 
-    setToOption(null);
+    if (!sameInput) previousSelection = null;
+    setShowAll(false);
   }, [firstFile]);
+
+  useEffect(() => {
+    if (fileExt && fromOption && toOption) {
+      previousSelection = { fileExt, from: fromOption, to: toOption };
+    }
+  }, [fromOption, toOption]);
+
+  useEffect(() => {
+    if (previousStep.current === "converting" && step !== "converting" && !popupOpen.peek()) {
+      actionRef.current?.focus();
+    }
+    previousStep.current = step;
+  }, [step]);
 
   const handleFromSelect = useCallback((option: ConversionOption | null) => {
     setFromOption(option);
@@ -255,16 +247,18 @@ export default function Conversion() {
     try {
       const inputFileData = [];
       for (const f of files) {
-        const buf = await f.arrayBuffer();
+        let buf;
+        try {
+          buf = await f.arrayBuffer();
+        } catch (e) {
+          if (f.size >= 2 ** 31)
+            throw new Error(`${f.name} is too large.`, {
+              cause: e,
+            });
+          throw e;
+        }
         const bytes = new Uint8Array(buf);
 
-        if (
-          fromOption[0].mime === toOption[0].mime &&
-          fromOption[0].format === toOption[0].format
-        ) {
-          downloadFile(bytes, f.name, toOption[0].mime);
-          continue;
-        }
         inputFileData.push({ name: f.name, bytes });
       }
 
@@ -277,12 +271,10 @@ export default function Conversion() {
       const fromNode = { handler: fromOption[1], format: fromOption[0] };
       const toNode = { handler: toOption[1], format: toOption[0] };
 
-      const output = await window.tryConvertByTraversing(
-        inputFileData,
-        fromNode,
-        toNode,
-        abortController.signal,
-      );
+      const output = await window.tryConvertByTraversing(inputFileData, fromNode, toNode, {
+        abort: abortController.signal,
+        settings,
+      });
 
       if (!output) {
         setIsConverting(false);
@@ -293,12 +285,12 @@ export default function Conversion() {
           dismissible: true,
           buttonText: "OK",
         };
-        openPopup();
+        openPopup(() => actionRef.current);
         return;
       }
 
       for (const file of output.files) {
-        downloadFile(file.bytes, file.name, toOption[0].mime);
+        downloadFile(file.bytes, filePath(file).replaceAll("/", "_"));
       }
 
       PopupData.value = {
@@ -307,7 +299,7 @@ export default function Conversion() {
         dismissible: true,
         buttonText: "OK",
       };
-      openPopup();
+      openPopup(() => actionRef.current);
     } catch (e) {
       console.error(e);
       if (e instanceof Error && e.name === "AbortError") {
@@ -315,11 +307,11 @@ export default function Conversion() {
       } else {
         PopupData.value = {
           title: "Conversion error",
-          text: `An unexpected error occurred: ${e}`,
+          text: `An unexpected error occurred: ${e instanceof Error ? e.message : String(e)}`,
           dismissible: true,
           buttonText: "OK",
         };
-        openPopup();
+        openPopup(() => actionRef.current);
       }
     } finally {
       setIsConverting(false);
@@ -337,13 +329,19 @@ export default function Conversion() {
 
   const handleAddChange = () => {
     addFiles(addFileRef.current?.files);
+    if (addFileRef.current) addFileRef.current.value = "";
   };
 
-  const canProceed = step === "select-from" ? !!fromOption : !!fromOption && !!toOption;
+  const canProceed =
+    step === "select-from" ? !!fromOption : !!fromOption && !!toOption && !!firstFile;
 
   return (
     <div className="conversion-body">
-      <ConversionHeader logoDisabled={step === "converting"} />
+      <ConversionHeader
+        logoDisabled={step === "converting"}
+        settingsCount={Object.keys(settings).length}
+        settingsDisabled={step === "converting"}
+      />
 
       <main className="conversion-main">
         {step === "converting" ? (
@@ -355,22 +353,43 @@ export default function Conversion() {
           />
         ) : (
           <FormatExplorer
-            conversionOptions={step === "select-from" ? matchingFrom : allOptions}
+            searchScopeRef={actionBarRef}
+            conversionOptions={allOptions}
+            matchingFrom={matchingFromSet}
+            onBack={handleBack}
+            onAdvance={(option) => {
+              if (step === "select-from") {
+                setFromOption(option);
+                setStep("select-to");
+              } else {
+                setToOption(option);
+                requestAnimationFrame(() => actionRef.current?.focus());
+              }
+            }}
             onSelect={step === "select-from" ? handleFromSelect : handleToSelect}
             direction={step === "select-from" ? "from" : "to"}
             fromOption={fromOption}
             toOption={toOption}
-            fromCount={countAvailableFormats(matchingFrom, "from", isAdvanced)}
+            fromCount={countAvailableFormats(
+              showAll ? allOptions : matchingFrom,
+              "from",
+              isAdvanced,
+            )}
             toCount={countAvailableFormats(allOptions, "to", isAdvanced)}
             onClickFrom={handleFromToClickFrom}
             onClickTo={handleFromToClickTo}
+            showAll={showAll}
+            onShowAll={() => setShowAll(true)}
           />
+        )}
+        {SettingsPanelOpen.value && step !== "converting" && (
+          <SettingsPanel specs={settingSpecs} formatName={toOption?.[0].format.toUpperCase()} />
         )}
       </main>
 
       {step !== "converting" && (
-        <div className="conversion-action-bar">
-          <div className="conversion-action-files">
+        <div className="conversion-action-bar" ref={actionBarRef}>
+          <div className="conversion-action-files" ref={filesRef}>
             {Object.entries(SelectedFiles.value).map(([key, file]) => (
               <FileInfoBadge
                 key={key}
@@ -378,26 +397,33 @@ export default function Conversion() {
                 fileSize={file.size}
                 extension={file.name.split(".").pop()}
                 mimeType={file.type}
-                onRemove={() => removeFile(key)}
+                onRemove={() => {
+                  // Badges render in SelectedFiles order, so the key's index matches the DOM.
+                  const buttons = [
+                    ...(filesRef.current?.querySelectorAll<HTMLButtonElement>(
+                      ".file-info-remove",
+                    ) ?? []),
+                  ];
+                  const index = Object.keys(SelectedFiles.value).indexOf(key);
+                  const next = buttons[index + 1] ?? buttons[index - 1];
+                  removeFile(key);
+                  requestAnimationFrame(() => {
+                    if (next?.isConnected) next.focus();
+                    else addButtonRef.current?.focus();
+                  });
+                }}
               />
             ))}
-            <div
+            <button
+              ref={addButtonRef}
+              type="button"
               className="file-info-badge file-info-add"
               onClick={handleAddClick}
-              role="button"
-              tabIndex={0}
               aria-label="Add more files"
             >
-              <input
-                ref={addFileRef}
-                type="file"
-                multiple
-                hidden
-                onClick={(ev) => ev.stopPropagation()}
-                onChange={handleAddChange}
-              />
               <Plus size={16} />
-            </div>
+            </button>
+            <input ref={addFileRef} type="file" multiple hidden onChange={handleAddChange} />
           </div>
           {step === "select-to" && (
             <StyledButton onClick={handleBack}>
@@ -406,6 +432,8 @@ export default function Conversion() {
             </StyledButton>
           )}
           <StyledButton
+            buttonRef={actionRef}
+            className="conversion-primary-action"
             variant={ButtonVariant.Primary}
             disabled={!canProceed}
             onClick={step === "select-from" ? handleNext : handleConvert}

@@ -1,3 +1,5 @@
+import { decode } from "src/common/index.ts";
+
 /**
  * LZH/LHA Archive Decoder
  * Implements LHA archive format parsing and LZH decompression
@@ -14,7 +16,7 @@ export interface LHAFile {
   crc: number;
   method: string;
   os: number;
-  data: Uint8Array;
+  data: Uint8Array<ArrayBuffer>;
 }
 
 export class LZHDecoder {
@@ -44,7 +46,7 @@ export class LZHDecoder {
     return low | (high << 16);
   }
 
-  private readBytes(length: number): Uint8Array {
+  private readBytes(length: number): Uint8Array<ArrayBuffer> {
     if (this.offset + length > this.data.length) {
       throw new EOFError("Unexpected end of file.");
     }
@@ -65,8 +67,7 @@ export class LZHDecoder {
     }
     // Only decode up to the null terminator
     const validBytes = bytes.slice(0, actualLength);
-    const decoder = new TextDecoder("utf-8", { fatal: false });
-    let str = decoder.decode(validBytes);
+    let str = decode(validBytes);
     // Remove any remaining null bytes and control characters
     // oxlint-disable-next-line eslint/no-control-regex
     str = str.replace(/[\x00-\x1F\x7F]/g, "");
@@ -180,7 +181,7 @@ export class LZHDecoder {
     const compressedData = this.readBytes(compressedSize);
 
     // Decompress the data
-    let decompressedData: Uint8Array;
+    let decompressedData: Uint8Array<ArrayBuffer>;
 
     if (method === "-lh0-") {
       // No compression
@@ -234,7 +235,7 @@ export class LZHDecoder {
   /**
    * Decompress LH1 format (LZSS with 4KB dictionary)
    */
-  private decompressLH1(compressed: Uint8Array, originalSize: number): Uint8Array {
+  private decompressLH1(compressed: Uint8Array, originalSize: number): Uint8Array<ArrayBuffer> {
     const output = new Uint8Array(originalSize);
     const dictionary = new Uint8Array(4096);
     let outPos = 0;
@@ -291,7 +292,7 @@ export class LZHDecoder {
    * Decompress LH5/6/7 format (LZSS with Huffman coding)
    * Simplified implementation
    */
-  private decompressLH5(compressed: Uint8Array, originalSize: number): Uint8Array {
+  private decompressLH5(compressed: Uint8Array, originalSize: number): Uint8Array<ArrayBuffer> {
     // This is a simplified version
     // Full implementation would require proper Huffman tree decoding
     const output = new Uint8Array(originalSize);

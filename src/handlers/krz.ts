@@ -1,29 +1,14 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import JSZip from "jszip";
+import { changeExt, ownedBytes } from "src/common/index.ts";
 
 class krzHandler implements FormatHandler {
-  public name: string = "krz";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "krz";
+  public supportedFormats = [Formats.PNG.builder("png").to(), Formats.KRZ.builder("krz").from()];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.PNG.builder("png").allowFrom(false).allowTo(true),
-
-      {
-        name: "Krita Raster Archive (krz)",
-        format: "krz",
-        extension: "krz",
-        mime: "application/x-krita",
-        from: true,
-        to: false,
-        internal: "krz",
-        category: ["archive"],
-        lossless: false,
-      },
-    ];
     this.ready = true;
   }
 
@@ -45,8 +30,8 @@ class krzHandler implements FormatHandler {
 
         const imageData = await imageFile.async("uint8array");
         outputFiles.push({
-          name: inputFile.name.replace(/\.krz$/, ".png"),
-          bytes: imageData,
+          name: changeExt(inputFile.name, "png"),
+          bytes: ownedBytes(imageData),
         });
       }
     }

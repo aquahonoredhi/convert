@@ -1,28 +1,54 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import { imageToText, rgbaToGrayscale } from "./image-to-txt/src/convert.ts";
+import { imageToText, rgbaToGrayscale } from "built/image-to-txt/src/convert.ts";
 import { InitializationError } from "src/errors.ts";
+import {
+  blobToCanvas,
+  canvasToBlob,
+  createCanvas,
+  resizeCanvas,
+  resolveSize,
+  type CanvasBundle,
+} from "src/common/canvas.ts";
+import type { FormatOptions } from "src/Settings.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
+import { numberOption } from "src/Settings.ts";
+
+const DEFAULT_FONT_SIZE = 48;
+
+const IMAGE_OPTIONS = {
+  width: true,
+  height: true,
+  fontSize: {
+    type: "number",
+    label: "Font size for text",
+    unit: "px",
+    min: 1,
+    max: 1000,
+    integer: true,
+  },
+} satisfies FormatOptions;
 
 class canvasToBlobHandler implements FormatHandler {
-  public name: string = "canvasToBlob";
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.PNG.supported("png", true, true, true),
-    CommonFormats.JPEG.supported("jpeg", true, true),
-    CommonFormats.WEBP.supported("webp", true, true),
-    CommonFormats.GIF.supported("gif", true, false),
-    CommonFormats.TEXT.supported("text", true, true),
+  public readonly name = "canvasToBlob";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().options(IMAGE_OPTIONS).fromTo(),
+    Formats.JPEG.builder("jpeg")
+      .options({ ...IMAGE_OPTIONS, quality: true })
+      .fromTo(),
+    Formats.WEBP.builder("webp")
+      .options({ ...IMAGE_OPTIONS, quality: true })
+      .fromTo(),
+    Formats.GIF.builder("gif").from(),
+    Formats.TEXT.builder("text").fromTo(),
   ];
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
-
-  public ready: boolean = false;
-  public offload: boolean = true;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.#canvas = new OffscreenCanvas(1, 1);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas();
     this.ready = true;
   }
 
@@ -30,58 +56,56 @@ class canvasToBlobHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    convertCtx?: ConvertContext,
   ): Promise<FileData[]> {
-    if (!this.#canvas || !this.#ctx) {
+    const options = convertCtx?.options ?? {};
+    const quality = options.quality;
+    if (!this.#bundle) {
       throw new InitializationError("Handler not initialized.");
     }
+    const { ctx, canvas } = this.#bundle;
 
     const outputFiles: FileData[] = [];
     for (const inputFile of inputFiles) {
       if (inputFormat.mime === "text/plain") {
-        const font = "48px sans-serif";
-        const fontSize = parseInt(font);
+        const fontSize = numberOption(options, "fontSize") ?? DEFAULT_FONT_SIZE;
+        const font = `${fontSize}px sans-serif`;
         const footerPadding = fontSize * 0.5;
-        const string = new TextDecoder().decode(inputFile.bytes);
+        const string = decode(inputFile.bytes);
         const lines = string.split("\n");
 
-        this.#ctx.font = font;
+        ctx.font = font;
 
         let maxLineWidth = 0;
         for (const line of lines) {
-          const width = this.#ctx.measureText(line).width;
+          const width = ctx.measureText(line).width;
           if (width > maxLineWidth) maxLineWidth = width;
         }
 
-        this.#canvas.width = maxLineWidth;
-        this.#canvas.height = Math.floor(fontSize * lines.length + footerPadding);
+        canvas.width = maxLineWidth;
+        canvas.height = Math.floor(fontSize * lines.length + footerPadding);
 
         if (outputFormat.mime === "image/jpeg") {
-          this.#ctx.fillStyle = "white";
-          this.#ctx.fillRect(0, 0, this.#canvas.width, this.#canvas.height);
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
-        this.#ctx.fillStyle = "black";
-        this.#ctx.strokeStyle = "white";
-        this.#ctx.font = font;
+        ctx.fillStyle = "black";
+        ctx.strokeStyle = "white";
+        ctx.font = font;
 
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
-          this.#ctx.fillText(line, 0, fontSize * (i + 1));
-          this.#ctx.strokeText(line, 0, fontSize * (i + 1));
+          ctx.fillText(line, 0, fontSize * (i + 1));
+          ctx.strokeText(line, 0, fontSize * (i + 1));
         }
       } else {
-        const blob = new Blob([inputFile.bytes as BlobPart], { type: inputFormat.mime });
-
-        const image = await createImageBitmap(blob);
-
-        this.#canvas.width = image.width;
-        this.#canvas.height = image.height;
-        this.#ctx.drawImage(image, 0, 0);
+        await blobToCanvas(this.#bundle, inputFile.bytes, inputFormat.mime);
       }
 
-      let bytes: Uint8Array;
+      let bytes: Uint8Array<ArrayBuffer>;
       if (outputFormat.mime === "text/plain") {
-        const pixels = this.#ctx.getImageData(0, 0, this.#canvas.width, this.#canvas.height);
-        bytes = new TextEncoder().encode(
+        const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        bytes = encode(
           imageToText({
             width() {
               return pixels.width;
@@ -101,13 +125,22 @@ class canvasToBlobHandler implements FormatHandler {
           }),
         );
       } else {
-        const blob = await this.#canvas.convertToBlob({
-          type: outputFormat.mime,
-        });
-        bytes = new Uint8Array(await blob.arrayBuffer());
+        resizeCanvas(this.#bundle, resolveSize(canvas.width, canvas.height, options));
+        if (outputFormat.mime === "image/jpeg") {
+          ctx.save();
+          ctx.globalCompositeOperation = "destination-over";
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.restore();
+        }
+        bytes = await canvasToBlob(
+          this.#bundle,
+          outputFormat.mime,
+          quality === undefined ? undefined : quality / 100,
+        );
       }
 
-      const name = inputFile.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+      const name = changeExt(inputFile.name, outputFormat.extension);
 
       outputFiles.push({ bytes, name });
     }

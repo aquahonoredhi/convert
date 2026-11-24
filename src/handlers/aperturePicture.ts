@@ -1,33 +1,21 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import { BadMagicError, InitializationError } from "src/errors.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
+import { createCanvas, type CanvasBundle } from "src/common/canvas.ts";
 
 class aperturePictureHandler implements FormatHandler {
-  public name: string = "aperturePicture";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "aperturePicture";
+  public supportedFormats = [
+    Formats.APF.builder("apf").lossless().fromTo(),
+    Formats.BMP.builder("bmp").lossless().fromTo(),
+  ];
+  public ready = false;
 
-  #canvas?: OffscreenCanvas;
-  #ctx?: OffscreenCanvasRenderingContext2D;
+  #bundle?: CanvasBundle;
 
   async init() {
-    this.supportedFormats = [
-      {
-        name: "Aperture Picture Format",
-        format: "apf",
-        extension: "apf",
-        mime: "image/x-aperture-picture",
-        from: true,
-        to: true,
-        internal: "apf",
-        category: Category.IMAGE,
-        lossless: true,
-      },
-      CommonFormats.BMP.builder("bmp").allowFrom(true).allowTo(true).markLossless(),
-    ];
-    this.#canvas = new OffscreenCanvas(320, 200);
-    this.#ctx = this.#canvas.getContext("2d") || undefined;
+    this.#bundle = createCanvas(320, 200);
     this.ready = true;
   }
 
@@ -37,11 +25,10 @@ class aperturePictureHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
-    const decoder = new TextDecoder();
 
     if (inputFormat.internal === "apf") {
       for (const file of inputFiles) {
-        const text = decoder.decode(file.bytes);
+        const text = decode(file.bytes);
         const lines = text.split(/\r?\n/);
         if (lines[0] !== "APERTURE IMAGE FORMAT (c) 1985")
           throw new BadMagicError(
@@ -55,25 +42,26 @@ class aperturePictureHandler implements FormatHandler {
 
         outputFiles.push({
           bytes: bmp,
-          name: file.name.replace(/\.[^/.]+$/, "") + ".bmp",
+          name: changeExt(file.name, "bmp"),
         });
       }
     } else if (inputFormat.internal === "bmp") {
-      if (!this.#canvas || !this.#ctx) {
+      if (!this.#bundle) {
         throw new InitializationError("Handler not initialized.");
       }
+      const { canvas, ctx } = this.#bundle;
       for (const inputFile of inputFiles) {
-        const blob = new Blob([inputFile.bytes as BlobPart], { type: inputFormat.mime });
+        const blob = new Blob([inputFile.bytes], { type: inputFormat.mime });
         const image = await createImageBitmap(blob);
         try {
-          this.#ctx.fillStyle = "white";
-          this.#ctx.fillRect(0, 0, this.#canvas.width, this.#canvas.height);
-          this.#ctx.drawImage(image, 0, 0, this.#canvas.width, this.#canvas.height);
+          ctx.fillStyle = "white";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
         } finally {
           image.close();
         }
 
-        const pixels = this.#ctx.getImageData(0, 0, this.#canvas.width, this.#canvas.height);
+        const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const data = new Uint8Array(pixels.width * pixels.height);
         for (let i = 0; i < data.length; i++) {
           const brightness = rgbaToGrayscale(
@@ -85,8 +73,8 @@ class aperturePictureHandler implements FormatHandler {
           data[i] = brightness < 128 ? 0 : 255;
         }
         outputFiles.push({
-          bytes: new TextEncoder().encode(encodeAPF(data)),
-          name: inputFile.name.replace(/\.[^/.]+$/, "") + ".apf",
+          bytes: encode(encodeAPF(data)),
+          name: changeExt(inputFile.name, "apf"),
         });
       }
     } else {
@@ -101,7 +89,7 @@ function rgbaToGrayscale(r: number, g: number, b: number, a: number): number {
   return 0.299 * (r * a) + 0.587 * (g * a) + 0.114 * (b * a);
 }
 
-function decodeAPF(data: string, SK: number): Uint8Array {
+function decodeAPF(data: string, SK: number): Uint8Array<ArrayBuffer> {
   const w = 320,
     h = 200;
   if (SK <= 0) throw new RangeError(`Malformed APF file (SK is invalid, <= 0): ${SK}`);
@@ -135,40 +123,13 @@ function decodeAPF(data: string, SK: number): Uint8Array {
 }
 
 // split array into 200 arrays that are then reversed, converted into 255s and 0s, and turned back into 1 array
-function APFarray(data: Uint8Array): Uint8Array {
-  let temparray: number[] = [];
-  let newarray: number[][] = [];
-  let pal: number[] = [];
-  let ispalflipped: boolean = false;
-
-  for (const b of data) {
-    if (!pal.includes(b)) {
-      // get used colors
-      pal.push(b);
-    }
-    if (pal.length === 2) {
-      break;
-    }
+function APFarray(data: Uint8Array): Uint8Array<ArrayBuffer> {
+  const rows = Math.floor(data.length / 320);
+  const out = new Uint8Array(rows * 320);
+  for (let row = 0; row < rows; row++) {
+    out.set(data.subarray(row * 320, (row + 1) * 320), (rows - 1 - row) * 320);
   }
-  if (pal[0] > pal[1]) {
-    ispalflipped = true;
-  }
-  for (const b of data) {
-    let uh = 0;
-    if (ispalflipped) {
-      uh = (1 - pal.indexOf(b)) * 255;
-    } else {
-      uh = pal.indexOf(b) * 255;
-    }
-    temparray.push(uh);
-    if (temparray.length === 320) {
-      newarray.push(temparray);
-      temparray = []; // clear temp array and add it to the new array
-    }
-  }
-
-  let revarray: Uint8Array = new Uint8Array(newarray.toReversed().flat());
-  return revarray;
+  return out;
 }
 
 function encodeAPF(data: Uint8Array): string {
@@ -200,7 +161,7 @@ function bitmapTo1BitBMP(
   bitmap: Uint8Array,
   width: number,
   height: number,
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
   const rowBytes = Math.ceil(width / 8);
   const paddedRowBytes = (rowBytes + 3) & ~3;
   const pixelArraySize = paddedRowBytes * height;

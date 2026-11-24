@@ -25,11 +25,14 @@
   height: 46px;
   padding: 0 0.95rem;
   border-radius: 10px;
-  border: 1px solid var(--border-transparent);
+  border: 1px solid transparent;
   background: var(--bg-section);
   color: var(--text-primary);
   cursor: pointer;
-  transition: all 150ms;
+  transition:
+    background 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
   min-width: 160px;
   justify-content: center;
 }
@@ -56,14 +59,14 @@
 }
 
 .fromto-pill.active {
-  border-color: var(--text-muted);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-muted) 15%, transparent);
+  border-color: var(--text-secondary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-secondary) 15%, transparent);
 }
 
 .fromto-pill:focus-visible {
   outline: none;
   border-color: var(--primary);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 15%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 .fromto-count {
@@ -71,4 +74,30 @@
   font-weight: 650;
   letter-spacing: 0.01em;
   color: var(--text-muted);
+}
+
+@media (max-width: 600px) {
+  .fromto-count-kind {
+    display: none;
+  }
+
+  .fromto {
+    gap: 0.5rem;
+  }
+
+  .fromto-pill {
+    flex: 1;
+    min-width: 0;
+    padding: 0 0.5rem;
+  }
+
+  .fromto-arrow {
+    flex-shrink: 0;
+  }
+
+  .fromto-count,
+  .fromto-ext {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
 }

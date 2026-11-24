@@ -1,62 +1,19 @@
 import type { FileData, FileFormat, FormatHandler } from "src/FormatHandler";
 import * as NBT from "nbtify";
-import { gunzipSync, gzipSync } from "fflate";
-import { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt } from "src/common/index.ts";
+import { compressGzip, decompressGzip } from "src/common/gzip.ts";
 
 class mcSchematicHandler implements FormatHandler {
-  public name: string = "mcSchematic";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "mcSchematic";
+  public supportedFormats = [
+    Formats.MC_SCHEMATIC.builder("schematic").lossless().fromTo(),
+    Formats.MC_SCHEM.builder("schem").lossless().fromTo(),
+    Formats.MC_LITEMATIC.builder("litematic").lossless().fromTo(),
+  ];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      {
-        name: "Minecraft Schematic",
-        format: "schematic",
-        extension: "schematic",
-        mime: "application/x-minecraft-schematic",
-        from: true,
-        to: true,
-        internal: "schematic",
-        category: Category.DATA,
-        lossless: true,
-      },
-      {
-        name: "Sponge Schematic",
-        format: "schem",
-        extension: "schem",
-        mime: "application/x-minecraft-schem",
-        from: true,
-        to: true,
-        internal: "schem",
-        category: Category.DATA,
-        lossless: true,
-      },
-      {
-        name: "Litematica Schematic",
-        format: "litematic",
-        extension: "litematic",
-        mime: "application/x-minecraft-litematic",
-        from: true,
-        to: true,
-        internal: "litematic",
-        category: Category.DATA,
-        lossless: true,
-      },
-      // Target internal format for graph routing
-      {
-        name: "Named Binary Tag",
-        format: "nbt",
-        extension: "nbt",
-        mime: "application/x-minecraft-nbt",
-        from: false,
-        to: true,
-        internal: "nbt",
-        category: Category.DATA,
-        lossless: true,
-      },
-    ];
     this.ready = true;
   }
 
@@ -71,7 +28,7 @@ class mcSchematicHandler implements FormatHandler {
       // Decompress GZipped NBT input
       let unzipped;
       try {
-        unzipped = gunzipSync(file.bytes);
+        unzipped = await decompressGzip(file.bytes);
       } catch {
         // Fallback for uncompressed NBT
         unzipped = file.bytes;
@@ -87,7 +44,6 @@ class mcSchematicHandler implements FormatHandler {
         if (outputFormat.internal === "litematic") {
           resultNbt = this.schemToLitematic(nbt.data);
         } else {
-          // Route Native Schematic NBTs to graph path
           resultNbt = nbt;
         }
       } else {
@@ -96,27 +52,11 @@ class mcSchematicHandler implements FormatHandler {
         );
       }
 
-      // Output processed intermediate NBT
-      let outBytes = await NBT.write(resultNbt);
-
-      // Handle file compression natively for endpoints (Litematic <-> Schem)
-      if (
-        outputFormat.internal === "litematic" ||
-        outputFormat.internal === "schem" ||
-        outputFormat.internal === "schematic"
-      ) {
-        outBytes = gzipSync(outBytes);
-        outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension,
-          bytes: outBytes,
-        });
-      } else {
-        // Not a native out-format (e.g., routing to JSON). Fallback to NBT extension for graph bridges.
-        outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + ".nbt",
-          bytes: outBytes,
-        });
-      }
+      const outBytes = await compressGzip(await NBT.write(resultNbt));
+      outputFiles.push({
+        name: changeExt(file.name, outputFormat.extension),
+        bytes: outBytes,
+      });
     }
 
     return outputFiles;
@@ -127,7 +67,7 @@ class mcSchematicHandler implements FormatHandler {
    * Note: Currently supports single-region Litematica files.
    */
   private litematicToSchem(data: any): NBT.NBTData {
-    const root = data as any;
+    const root = data;
 
     // 1. Validate
     if (!root.Regions) {
@@ -172,11 +112,15 @@ class mcSchematicHandler implements FormatHandler {
     const bitsPerBlock = Math.max(2, Math.ceil(Math.log2(litePalette.length)));
     const blockStates = region.BlockStates; // nbtify LongArray
 
-    const blockData = new Uint8Array(totalBlocks);
+    const blockData = new Uint32Array(totalBlocks);
 
     if (blockStates && blockStates.length > 0) {
       // Unpack bit logic payload into Uint8Array
-      const longs = new BigInt64Array(blockStates.buffer);
+      const longs = new BigUint64Array(
+        blockStates.buffer,
+        blockStates.byteOffset,
+        blockStates.length,
+      );
 
       let blockIndex = 0;
       const mask = (1n << BigInt(bitsPerBlock)) - 1n;
@@ -252,7 +196,7 @@ class mcSchematicHandler implements FormatHandler {
    * Converts a Sponge Schematic V2 NBT compound into a Litematica NBT compound.
    */
   private schemToLitematic(data: any): NBT.NBTData {
-    const root = data as any;
+    const root = data;
 
     // 1. Validate
     if (!root.Width || !root.Height || !root.Length || !root.Palette || !root.BlockData) {
@@ -270,11 +214,8 @@ class mcSchematicHandler implements FormatHandler {
 
     // Invert schematic palette to an array indexed by the ID
     const invertedPalette: { [id: number]: string } = {};
-    for (const [key, value] of Object.keys(schemPalette).map((k) => [
-      k,
-      schemPalette[k].valueOf(),
-    ])) {
-      invertedPalette[value as number] = key as string;
+    for (const [key, id] of Object.entries(schemPalette)) {
+      invertedPalette[Number(id)] = key;
     }
 
     const paletteSize = Object.keys(invertedPalette).length;
@@ -365,8 +306,8 @@ class mcSchematicHandler implements FormatHandler {
       Name: root.Metadata?.Name || "Converted Schematic",
       Description: "",
       RegionCount: new NBT.Int32(1),
-      TimeCreated: new NBT.Float32(Date.now()),
-      TimeModified: new NBT.Float32(Date.now()),
+      TimeCreated: BigInt(Date.now()),
+      TimeModified: BigInt(Date.now()),
       TotalBlocks: new NBT.Int32(totalBlocks),
       TotalVolume: new NBT.Int32(totalBlocks),
     };

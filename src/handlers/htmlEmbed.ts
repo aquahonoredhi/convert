@@ -1,33 +1,24 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
 
 class htmlEmbedHandler implements FormatHandler {
-  public name: string = "htmlEmbed";
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.HTML.supported("html", false, true, true),
-    CommonFormats.PNG.supported("png", true, false),
-    CommonFormats.JPEG.supported("jpeg", true, false),
-    CommonFormats.WEBP.supported("webp", true, false),
-    CommonFormats.GIF.supported("gif", true, false),
-    CommonFormats.SVG.supported("svg", true, false),
-    CommonFormats.TEXT.supported("text", true, false),
-    CommonFormats.MP4.builder("mp4").allowFrom(),
-    CommonFormats.MP3.supported("mp3", true, false),
+  public readonly name = "htmlEmbed";
+  public supportedFormats = [
+    Formats.HTML.builder("html").lossless().to(),
+    Formats.PNG.builder("png").from(),
+    Formats.JPEG.builder("jpeg").from(),
+    Formats.WEBP.builder("webp").from(),
+    Formats.GIF.builder("gif").from(),
+    Formats.SVG.builder("svg").from(),
+    Formats.TEXT.builder("text").from(),
+    Formats.MP4.builder("mp4").from(),
+    Formats.MP3.builder("mp3").from(),
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
-  }
-
-  static bytesToBase64(bytes: Uint8Array): string {
-    const chunks = [];
-    for (let i = 0; i < bytes.length; i += 32768) {
-      const byteChunk = bytes.subarray(i, i + 32768);
-      chunks.push(String.fromCharCode(...byteChunk));
-    }
-    return btoa(chunks.join(""));
   }
 
   async doConvert(
@@ -38,22 +29,19 @@ class htmlEmbedHandler implements FormatHandler {
     if (outputFormat.internal !== "html")
       throw new TypeError(`Unsupported output format: ${outputFormat.internal}`);
 
-    const encoder = new TextEncoder();
-    let html = "";
+    let html = '<meta charset="utf-8">';
 
-    if (inputFormat.internal === "text") {
-      const decoder = new TextDecoder();
-      for (const inputFile of inputFiles) {
-        const text = decoder
-          .decode(inputFile.bytes)
+    for (const inputFile of inputFiles) {
+      if (inputFormat.internal === "text") {
+        const text = decode(inputFile.bytes)
           .replaceAll("&", "&amp;")
           .replaceAll("<", "&lt;")
           .replaceAll(">", "&gt;");
         html += `<pre>${text}</pre>`;
-      }
-    } else {
-      for (const inputFile of inputFiles) {
-        const base64 = htmlEmbedHandler.bytesToBase64(inputFile.bytes);
+      } else if (inputFormat.internal === "svg") {
+        html += `<div><template shadowrootmode="open">${decode(inputFile.bytes)}</template></div><br>`;
+      } else {
+        const base64 = inputFile.bytes.toBase64();
 
         if (inputFormat.mime.startsWith("image/")) {
           html += `<img src="data:${inputFormat.mime};base64,${base64}"><br>`;
@@ -69,9 +57,8 @@ class htmlEmbedHandler implements FormatHandler {
       }
     }
 
-    const bytes = encoder.encode(html);
-    const name =
-      inputFiles[0].name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension;
+    const bytes = encode(html);
+    const name = changeExt(inputFiles[0].name, outputFormat.extension);
     return [{ bytes, name }];
   }
 }

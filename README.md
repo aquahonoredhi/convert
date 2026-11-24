@@ -13,9 +13,9 @@ For a semi-technical overview of this tool, check out the video: https://youtu.b
 ## Usage
 
 1. Go to [convert.to.it](https://convert.to.it/)
-2. Click the big blue box to add your file (or just drag it on to the window).
-3. An input format should have been automatically selected. If it wasn't, yikes! Try searching for it, or if it's really not there, see the "Issues" section below.
-4. Select an output format from the second list. If you're on desktop, that's the one on the right side. If you're on mobile, it'll be somewhere lower down.
+2. Click the big box to add your file (or just drag it on to the window).
+3. An input format should have been automatically selected (as shown at the top). If not, yikes! Try pressing "Show all" and searching for it, or if it's really not there, see the "Issues" section below.
+4. Press "Next" and select your output format.
 5. Click **Convert**!
 6. Hopefully, after a bit (or a lot) of thinking, the program will spit out the file you wanted. If not, see the "Issues" section below.
 
@@ -31,8 +31,8 @@ There are thousands of file formats out there. It can take hours to add support 
 When suggesting a file format, you must _at minimum_:
 
 - Make sure that there isn't already an issue about the same thing, and that we don't already support the format.
-- Explain what you expect the conversion to be like (what medium is it converting to/from). It's important to note here that simply parsing the underlying data is _not sufficient_. Imagine if we only treated SVG images as raw XML data and didn't support converting them to raster images - that would defeat the point. In other words, try to avoid crude "binary waterfalls".
-- Provide links to existing browser-based solutions if possible, or at the very least a reference for implementing the format, and make sure the license is compatible with GPL-2.0.
+- Explain what you expect the conversion to be like (what medium is it converting to/from). It's important to note here that simply parsing the underlying data is _not sufficient_. Imagine if we only treated SVG images as raw XML data and didn't support converting them to raster images - that would defeat the point. In other words, try to avoid crude ["waterfalls"](docs/design/WATERFALLS.md).
+- Provide links to existing browser-based solutions if possible, or at the very least a reference for implementing the format, and make sure the license is compatible with GPL-2.0-or-later.
 
 If this seems like a lot, please remember - a developer will have to do 100x more work to actually implement the format. Doing a bit of research not only saves them precious time, it also weeds out "unserious" proposals that would only bloat our to-do list.
 
@@ -44,18 +44,16 @@ Though please note, "converting X to Y doesn't work" is **not** a bug report. Ho
 
 ### Local development (Bun + Vite)
 
-1. Clone this repository _**WITH SUBMODULES**_. You can use `git clone --recursive https://github.com/p2r3/convert` for that. Omitting submodules will leave you missing a few dependencies.
+1. Clone this repository with `git clone https://github.com/p2r3/convert`.
 2. Install [Bun](https://bun.sh/).
 3. Run `bun install` to install dependencies.
-4. Run `bunx vite` to start the development server.
+4. Run `bun run dev` to prepare and start the development server.
 
 _The following steps are optional, but recommended for performance:_
 
 When you first open the page, it'll take a while to generate the list of supported formats for each tool. If you open the console, you'll see it complaining a bunch about missing caches.
 
-After this is done (indicated by a `Built initial format list` message in the console), use `printSupportedFormatCache()` to get a JSON string with the cache data. You can then save this string to `cache.json` to skip that loading screen on startup.
-
-If you run into issues where your changes seem to not be applying, try disabling this cache.
+You can generate this list beforehand and save it into `dist/` by running `bun run cache:build` after `bun run build`. If you run into issues where your changes seem to not be applying, try deleting `dist/cache.json`.
 
 ### Docker (prebuilt image)
 
@@ -79,6 +77,10 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.override.ym
 
 The first Docker build is expected to be slow because Chromium and related system packages are installed in the build stage (needed for puppeteer in `buildCache.js`). Later builds are usually much faster due to Docker layer caching.
 
+### Manual
+
+Run `bun run build` and then `bun run cache:build`. Then serve the `dist/` folder on any HTTP server of your choice.
+
 ## Contributing
 
 The best way to contribute is by adding support for new file formats (duh). If you don't have a format to add but are eager to help, take a look at our issues. There are plenty of suggestions there.
@@ -95,29 +97,17 @@ Below is a super barebones handler that does absolutely nothing. You can use thi
 // file: dummy.ts
 
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 
 class dummyHandler implements FormatHandler {
-  public name: string = "dummy";
-  public supportedFormats: FileFormat[] = [
-    // Example PNG format, with both input and output disabled
-    CommonFormats.PNG.builder("png").markLossless().allowFrom(false).allowTo(false),
-
-    // Alternatively, if you need a custom format, define it like so:
-    {
-      name: "CompuServe Graphics Interchange Format (GIF)",
-      format: "gif",
-      extension: "gif",
-      mime: "image/gif",
-      from: false,
-      to: false,
-      internal: "gif",
-      category: [Category.IMAGE, Category.VIDEO], // See src/CommonFormats.ts for valid categories
-      lossless: false,
-    },
+  public readonly name = "dummy";
+  public supportedFormats = [
+    Formats.PNG.builder("png").lossless().fromTo(),
+    // modifiers go before the direction
+    Formats.GIF.builder("gif").to(),
+    // add custom formats to Formats.ts
   ];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public ready = false;
 
   async init() {
     this.ready = true;
@@ -136,16 +126,17 @@ class dummyHandler implements FormatHandler {
 export default dummyHandler;
 ```
 
+After that, make sure to add add `dummy: []` into the HANDLERS array in [src/handlers/index.ts](src/handlers/index.ts) so it can be used in conversions.
+
 For more details on how all of these components work, refer to the doc comments in [src/FormatHandler.ts](src/FormatHandler.ts). You can also take a look at existing handlers to get a more practical example.
 
 There are a few additional things that I want to point out in particular:
 
 - Pay attention to the naming system. If your tool is called `dummy`, then the class should be called `dummyHandler`, and the file should be called `dummy.ts`.
 - The handler is responsible for setting the output file's name. This is done to allow for flexibility in rare cases where the _full_ file name matters. Of course, in most cases, you'll only have to swap the file extension.
-- The handler is also responsible for ensuring that any FileData or byte buffer objects that enter the handler _do not get mutated_. If necessary, clone the buffer by wrapping it in `new Uint8Array()`.
 - When handling MIME types, run them through [normalizeMimeType](src/normalizeMimeType.ts) first. One file can have multiple valid MIME types, which isn't great when you're trying to match them algorithmically.
 - Your handler may run in a web worker, so make sure that you do not use any incompatible Web APIs. `HTMLCanvasElement` -> `OffscreenCanvas` (`toBlob()` -> `convertToBlob()`), `new Image()` -> `createImageBitmap()`, avoid web audio and DOM APIs where possible. `offload` is last resort.
-- When implementing/suggesting a new file format, please treat the file as the media that it represents, not the data that it contains. For example, if you were making an SVG handler, you should treat the file as an _image_, not as XML. In other words, avoid simple "binary waterfalls", as they're not semantically meaningful.
+- When implementing/suggesting a new file format, please treat the file as the media that it represents, not the data that it contains. For example, if you were making an SVG handler, you should treat the file as an _image_, not as XML. In other words, avoid ["waterfalls"](docs/design/WATERFALLS.md), as they're not semantically meaningful.
 
 ### Testing
 
@@ -161,21 +152,23 @@ Not every handler needs a dedicated unit test, but handlers with non-trivial cus
 If your tool requires an external dependency (which it likely does), there are currently two well-established ways of going about this:
 
 - If it's an `npm` package, just install it to the project like you normally would.
-- If it's a Git repository, add it as a submodule to [src/handlers](src/handlers).
-- If neither of the above are available, then **as a last resort**, you may create a folder with the required assets under `src/handlers/handlerName`.
+- Everything else should use our build system. Usually you can just run `bun run build:add <name> <tar.gz or zip url>`, then `bun run build:assemble`, then import from the `built/<name>` folder. The full reference is under [recipe/README.md](recipe/README.md).
 
-**Please try to avoid CDNs (Content Delivery Networks).** They're really cool on paper, but they don't work well with TypeScript, and each one introduces a tiny bit of instability. For a project that leans heavily on external dependencies, those bits of instability can add up fast.
+**Please do not use CDNs (Content Delivery Networks).** They're really cool on paper, but they don't work well with TypeScript, and each one introduces a tiny bit of instability. For a project that leans heavily on external dependencies, those bits of instability can add up fast.
 
-- If you need to load a WebAssembly binary (or similar), add its path to [vite.config.js](vite.config.js) and target it under `/convert/wasm/`. **Do not link to node_modules**.
+- If you need to load a WebAssembly binary (or similar), use vite's ?url imports, like `import wasmUrl from "node_modules/stuff/wasm.wasm?url"` (or copy it into the output using vite.config.js). Don't try to fetch stuff from node_modules directly.
 
 ### AI Usage Policy
 
-If you intend to use an LLM, agent-enabled IDE, or other AI-driven tool for your contribution, please follow these guidelines:
+If you intend to use an AI/agentic/LLM tool for your contribution, please follow these guidelines:
 
-- Clearly state that you've used an LLM, ideally in your pull request's description. Do not attempt to pass off an AI's work as your own. I'm far more likely to accept a pull request that openly admits to using AI than one that does but pretends it doesn't. Transparency helps the maintainer (me) know what to keep an eye out for (e.g. hallucinations), and helps you keep yourself in check.
-- Do not overindulge. If your contribution is trivial or simple enough to be written by hand, please opt to write it by hand. This is especially true if it's your first contribution. You're much more likely to retain knowledge and understanding about architectural details if you've familiarized yourself with the process hands-on first.
-- Keep the scope to things you _could_ do by hand. LLMs are tools, and this is a community-driven project. Orchestrating an AI to write logic that you don't fully comprehend is not only reckless for a community project, it's also disrespectful towards human contributors who took the time to research their additions. In other words, there should _never_ be a scenario where you _need_ an LLM.
+- State where and how you used the LLM. Not disclosing it may get your PR insta-closed.
+- Do not use it to write descriptions for issues/PRs (except for translation). This may also lead to your contribution being insta-closed.
 - Explain what you (and the LLM) are doing, in a way that makes it clear that you understand the changes you're making.
+- Review the full diff of your PR manually (skipping over bulk thoughtless parts is fine).
+- Keep the scope to things you could do by hand. In other words, there should _never_ be a scenario where you _need_ an LLM. In other other words, if you don't understand what the LLM did, don't pull request it.
+- Do not overindulge. If your contribution is trivial or simple enough to be written by hand, please opt to write it by hand, especially if it's your first contribution. You are much more likely to retain architectural knowledge that way.
+- All agentic tools are not allowed to create pull requests without human oversight.
 
 Not adhering to these rules will likely get your pull request closed.
 

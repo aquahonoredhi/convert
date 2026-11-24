@@ -22,6 +22,8 @@
     border: 1px dashed var(--border-secondary);
     background: transparent;
     aspect-ratio: 1;
+    /* vertical padding + name line (font-size * line-height) + size line + border */
+    min-height: calc(0.8rem + 0.8125rem * 1.3 + 0.6875rem * 1.2 + 2px);
     padding: 0;
     justify-content: center;
     cursor: pointer;
@@ -64,8 +66,8 @@
     flex-shrink: 0;
 
     &:hover {
-      color: #ef4444;
-      background: rgba(239, 68, 68, 0.1);
+      color: var(--danger);
+      background: var(--danger-transparent);
     }
   }
 }

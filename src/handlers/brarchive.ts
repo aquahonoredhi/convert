@@ -1,6 +1,7 @@
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
-import JSZip from "jszip";
+import Formats, { SpecialFormats } from "src/Formats.ts";
+import { changeExt, decode, encode } from "src/common/index.ts";
+import { extractedParent, filePath, splitPath } from "src/common/path.ts";
 
 function read_lendian_4(a: number, b: number, c: number, d: number): number {
   return a + b * Math.pow(16, 2) + c * Math.pow(16, 4) + d * Math.pow(16, 6);
@@ -33,28 +34,14 @@ function write_lendian_4(x: number): number[] {
 }
 
 class brarchiveHandler implements FormatHandler {
-  public name: string = "brarchive";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "brarchive";
+  public supportedFormats = [
+    Formats.BRARCHIVE.builder("brarchive").lossless().fromTo(),
+    SpecialFormats.ANY.builder("ANY").lossless().fromTo(),
+  ];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.ZIP.supported("zip", true, true, true),
-      CommonFormats.JSON.supported("json", true, true, true),
-      {
-        name: "Minecraft Bedrock Archive",
-        format: "brarchive",
-        extension: "brarchive",
-        mime: "image/x-brarchive",
-        from: true,
-        to: true,
-        internal: "brarchive",
-        category: Category.ARCHIVE,
-        lossless: true,
-      },
-    ];
-
     this.ready = true;
   }
 
@@ -65,16 +52,12 @@ class brarchiveHandler implements FormatHandler {
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
 
-    if (
-      inputFormat.internal === "brarchive" &&
-      (outputFormat.internal === "zip" || outputFormat.internal === "json")
-    ) {
+    if (inputFormat.internal === "brarchive" && outputFormat.mime === SpecialFormats.ANY.mime) {
       // Thanks to @santiago046's documentation
 
       const file_entry_size = 1 + 247 + 4 + 4; // the size of a single FileEntry
 
       for (const file of inputFiles) {
-        const decoder = new TextDecoder();
         const numEntries: number = read_lendian_4(
           file.bytes[0x08],
           file.bytes[0x09],
@@ -88,7 +71,7 @@ class brarchiveHandler implements FormatHandler {
         for (let i = 0; i < numEntries; i++) {
           const file_name_length = file.bytes[byte_cursor];
           byte_cursor++;
-          const file_name: string = decoder.decode(
+          const file_name: string = decode(
             file.bytes.subarray(byte_cursor, byte_cursor + file_name_length),
           );
           byte_cursor += 247; // Names are stored as padded 247-length strings?? Weird but seems to be true.
@@ -111,10 +94,6 @@ class brarchiveHandler implements FormatHandler {
             file.bytes[byte_cursor + 3],
           ).toString();
 
-          if (data_size === "0") {
-            throw new Error("Error, file has no data. Can't meaningfully convert.");
-          }
-
           // Finally, store that information in the array
           FileEntries_info.push([file_name, absolute_offset, data_size]);
 
@@ -135,74 +114,18 @@ class brarchiveHandler implements FormatHandler {
           });
         }
 
-        if (outputFormat.internal === "zip") {
-          // And now, we simply zip the files!
-          const zip = new JSZip();
-          for (const ar_file of archiveFiles) {
-            zip.file(ar_file.name, ar_file.bytes);
-          }
-
-          // Finally, output the zip.
-          const output = await zip.generateAsync({ type: "uint8array" });
-          outputFiles.push({
-            bytes: output,
-            name: file.name.split(".").slice(0, -1).join(".") + "." + outputFormat.extension,
-          });
-        } else if (outputFormat.internal === "json") {
-          // First, validate that everything in the archive is in fact a .json file.
-          for (const ar_file of archiveFiles) {
-            if (!ar_file.name.endsWith(".json")) {
-              throw new Error(
-                "Error, brarchive doesn't consist solely of .json files, so we can't convert straight to that. " +
-                  ar_file.name,
-              );
-            }
-          }
-
-          // Then we just add the files to the output.
-          outputFiles.push(...archiveFiles);
+        // Extract everything; the converter detects what the files are.
+        const parent = extractedParent(file, inputFiles.length > 1);
+        for (const ar_file of archiveFiles) {
+          if (ar_file.bytes.length === 0) continue;
+          outputFiles.push({ ...splitPath(ar_file.name, parent), bytes: ar_file.bytes });
         }
       }
-    } else if (
-      (inputFormat.internal === "json" || inputFormat.internal === "zip") &&
-      outputFormat.internal === "brarchive"
-    ) {
-      const working_files: { [key: string]: FileData[] } = {};
-
-      // Special handling for zip input.
-      if (inputFormat.internal === "zip") {
-        for (const file of inputFiles) {
-          const zip = new JSZip();
-          await zip.loadAsync(file.bytes);
-
-          let done_something_flag = false;
-
-          // Extract all files from ZIP
-          working_files[file.name] = [];
-          for (const [filename, zipEntry] of Object.entries(zip.files)) {
-            if (!zipEntry.dir) {
-              if (filename.endsWith(".json") === false) {
-                throw new Error("Archive contains more than just .json files; abort.");
-              } else {
-                done_something_flag = true;
-                const data = await zipEntry.async("uint8array");
-                working_files[file.name].push({
-                  name: filename,
-                  bytes: data,
-                });
-              }
-            }
-          }
-
-          // Throw error if empty
-          if (!done_something_flag) {
-            throw new Error("No applicable files to unzip found in " + file.name);
-          }
-        }
-      } else {
-        working_files["Unnamed.brarchive"] = [];
-        working_files["Unnamed.brarchive"].push(...inputFiles);
-      }
+    } else if (outputFormat.internal === "brarchive" && inputFormat.internal !== "brarchive") {
+      // Pack all inputs into one archive. Mostly JSON in practice, but any bytes are fine.
+      const working_files: { [key: string]: FileData[] } = {
+        "Unnamed.brarchive": inputFiles,
+      };
 
       // Iterate through each collection of files.
       for (const key in working_files) {
@@ -221,15 +144,14 @@ class brarchiveHandler implements FormatHandler {
         working_bytes.push(0x01, 0x00, 0x00, 0x00);
 
         // Start writing FileEntry's
-        const encoder = new TextEncoder();
         for (let i = 0; i < working_files[key].length; i++) {
           // Shorten name if need be
-          let name = working_files[key][i].name;
-          while (encoder.encode(name).length > 247) {
+          let name = filePath(working_files[key][i]);
+          while (encode(name).length > 247) {
             name = name.substring(0, name.length - 1);
           }
 
-          const name_bytes: Uint8Array = encoder.encode(name);
+          const name_bytes: Uint8Array = encode(name);
           working_bytes.push(name_bytes.length);
 
           // Push name and padding
@@ -250,14 +172,19 @@ class brarchiveHandler implements FormatHandler {
         }
 
         // FileEntry's are done. Write raw data.
-        for (let i = 0; i < working_files[key].length; i++) {
-          working_bytes.push(...working_files[key][i].bytes);
+        const data_length = working_files[key].reduce((sum, f) => sum + f.bytes.length, 0);
+        const archive_bytes = new Uint8Array(working_bytes.length + data_length);
+        archive_bytes.set(working_bytes);
+        let data_cursor = working_bytes.length;
+        for (const working_file of working_files[key]) {
+          archive_bytes.set(working_file.bytes, data_cursor);
+          data_cursor += working_file.bytes.length;
         }
 
         // Finally, push our file.
         outputFiles.push({
-          bytes: new Uint8Array(working_bytes),
-          name: key.split(".").slice(0, -1).join(".") + "." + outputFormat.extension,
+          bytes: archive_bytes,
+          name: changeExt(key, outputFormat.extension),
         });
       }
     } else {

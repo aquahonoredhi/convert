@@ -1,17 +1,29 @@
 import { type FileData, type FileFormat, type FormatHandler } from "../FormatHandler.ts";
-import CommonFormats from "../CommonFormats.ts";
-import PDFDocument from "pdfkit/js/pdfkit.standalone";
+import Formats from "../Formats.ts";
+import PDFDocument, { registerStdFonts } from "pdfkit";
+import Courier from "pdfkit/standard-fonts/Courier";
+import { changeExt, decode, ownedBytes } from "src/common/index.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
+import { numberOption, stringOption } from "src/Settings.ts";
+
+const PAGE_SIZES = ["A3", "A4", "A5", "LETTER", "LEGAL"];
 
 class textToPdfHandler implements FormatHandler {
-  public name = "textToPdf";
-  public supportedFormats?: FileFormat[] = [
-    CommonFormats.TEXT.builder("text").allowFrom(true).allowTo(false),
-    CommonFormats.PDF.builder("pdf").allowFrom(false).allowTo(true),
+  public readonly name = "textToPdf";
+  public supportedFormats = [
+    Formats.TEXT.builder("text").from(),
+    Formats.PDF.builder("pdf")
+      .options({
+        pageSize: { type: "enum", label: "Page size", values: PAGE_SIZES },
+        fontSize: { type: "number", label: "Font size", unit: "pt", min: 1, max: 200 },
+        margin: { type: "number", label: "Margin", unit: "pt", min: 0, max: 144 },
+      })
+      .to(),
   ];
   public ready = false;
-  public offload: boolean = true;
 
   async init() {
+    registerStdFonts(Courier);
     this.ready = true;
   }
 
@@ -19,27 +31,33 @@ class textToPdfHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
+    const options = ctx?.options ?? {};
+    const pageSize = stringOption(options, "pageSize") ?? "A4";
+    const fontSize = numberOption(options, "fontSize") ?? 11;
+    const margin = numberOption(options, "margin") ?? 72;
 
     for (const file of inputFiles) {
-      const text = new TextDecoder().decode(file.bytes).replace(/\p{Extended_Pictographic}/gu, ""); // Remove emojis
+      const text = decode(file.bytes).replace(/\p{Extended_Pictographic}/gu, ""); // Remove emojis
 
       const doc = new PDFDocument({
-        size: "A4",
-        margins: { top: 72, bottom: 72, left: 72, right: 72 },
+        size: pageSize,
+        font: "Courier",
+        margins: { top: margin, bottom: margin, left: margin, right: margin },
       });
 
-      const pdfBytes = await new Promise<Uint8Array>((resolve, reject) => {
-        const chunks: Uint8Array[] = [];
+      const pdfBytes = await new Promise<Uint8Array<ArrayBuffer>>((resolve, reject) => {
+        const chunks: Uint8Array<ArrayBuffer>[] = [];
 
-        doc.on("data", (chunk: Uint8Array) => chunks.push(chunk));
+        doc.on("data", (chunk: Uint8Array) => chunks.push(ownedBytes(chunk)));
         doc.on("end", async () => {
           try {
-            const buffer = await new Blob(chunks as BlobPart[], {
+            const bytes = await new Blob(chunks, {
               type: "application/pdf",
-            }).arrayBuffer();
-            resolve(new Uint8Array(buffer));
+            }).bytes();
+            resolve(bytes);
           } catch (error) {
             reject(error);
           }
@@ -47,18 +65,17 @@ class textToPdfHandler implements FormatHandler {
 
         doc.on("error", reject);
 
-        doc.font("Courier").fontSize(11).fillColor("#000000");
+        doc.font("Courier").fontSize(fontSize).fillColor("#000000");
         doc.text(text.replace(/\r\n|\r/g, "\n"), {
-          width: 595.28 - 72 - 72,
+          width: doc.page.width - margin * 2,
           align: "left",
         });
 
         doc.end();
       });
 
-      const basename = file.name.split(".").slice(0, -1).join(".") || "document";
       outputFiles.push({
-        name: `${basename}.${outputFormat.extension}`,
+        name: changeExt(file.name, outputFormat.extension),
         bytes: pdfBytes,
       });
     }

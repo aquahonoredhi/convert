@@ -3,7 +3,8 @@ import { DOMParser } from "@xmldom/xmldom";
 import { SVGPathData } from "svg-pathdata";
 import { compress, decompress } from "woff2-encoder";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
+import { changeExt, decode, encode, ownedBytes } from "src/common/index.ts";
 
 function escapeHtml(str: string) {
   const map = new Map<string, string>();
@@ -16,7 +17,7 @@ function escapeHtml(str: string) {
   return str.replace(/[&<>"'\n]/g, (match) => map.get(match)!);
 }
 
-function sfntToSvg(inputFile: FileData, encoder: TextEncoder) {
+function sfntToSvg(inputFile: FileData) {
   const font = parse(inputFile.bytes.buffer);
   const unitsPerEm = font.unitsPerEm;
   const family = escapeHtml(font.names.fontFamily?.en || "ConvertedFont");
@@ -39,7 +40,7 @@ function sfntToSvg(inputFile: FileData, encoder: TextEncoder) {
     });
     const d = path.toPathData(5);
     glyphElements.push(
-      `<glyph unicode="${escapeHtml(String.fromCharCode(glyph.unicode))}" glyph-name="${glyph.name || ""}" horiz-adv-x="${glyph.advanceWidth}" d="${d}"/>`,
+      `<glyph unicode="${escapeHtml(String.fromCodePoint(glyph.unicode))}" glyph-name="${glyph.name || ""}" horiz-adv-x="${glyph.advanceWidth}" d="${d}"/>`,
     );
 
     // alphabetStringWidth = width of "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz"
@@ -87,8 +88,8 @@ function sfntToSvg(inputFile: FileData, encoder: TextEncoder) {
   </text>
 </svg>`;
 
-  const name = inputFile.name.split(".").slice(0, -1).join(".") + ".svg";
-  const bytes = encoder.encode(svgFont);
+  const name = changeExt(inputFile.name, "svg");
+  const bytes = encode(svgFont);
 
   return { bytes, name };
 }
@@ -125,9 +126,9 @@ function svgPathToOpenTypePath(d: string): Path {
   return path;
 }
 
-function svgToOtf(inputFile: FileData, decoder: TextDecoder) {
+function svgToOtf(inputFile: FileData) {
   const parser = new DOMParser();
-  const doc = parser.parseFromString(decoder.decode(inputFile.bytes), "image/svg+xml");
+  const doc = parser.parseFromString(decode(inputFile.bytes), "image/svg+xml");
 
   const fontFace = doc.getElementsByTagName("font-face")[0];
   const fontEl = doc.getElementsByTagName("font")[0];
@@ -185,7 +186,7 @@ function svgToOtf(inputFile: FileData, decoder: TextDecoder) {
   });
 
   const bytes = new Uint8Array(font.toArrayBuffer());
-  const name = inputFile.name.split(".").slice(0, -1).join(".") + ".otf";
+  const name = changeExt(inputFile.name, "otf");
 
   return { bytes, name };
 }
@@ -196,7 +197,7 @@ function svgToOtf(inputFile: FileData, decoder: TextDecoder) {
 function sfntToOtf(inputFile: FileData) {
   const font = parse(inputFile.bytes.buffer);
   const bytes = new Uint8Array(font.toArrayBuffer());
-  const name = inputFile.name.split(".").slice(0, -1).join(".") + ".otf";
+  const name = changeExt(inputFile.name, "otf");
 
   return { bytes, name };
 }
@@ -205,9 +206,9 @@ async function sfntToWoff2(inputFile: FileData): Promise<FileData> {
   const font = parse(inputFile.bytes.buffer);
   const sfnt = new Uint8Array(font.toArrayBuffer());
 
-  const bytes = await compress(sfnt);
+  const bytes = ownedBytes(await compress(sfnt));
 
-  const name = inputFile.name.split(".").slice(0, -1).join(".") + ".woff2";
+  const name = changeExt(inputFile.name, "woff2");
 
   return { bytes, name };
 }
@@ -215,28 +216,25 @@ async function sfntToWoff2(inputFile: FileData): Promise<FileData> {
 async function normalizeToSfnt(
   inputFile: FileData,
   inputFormat: FileFormat,
-  decoder: TextDecoder,
-): Promise<Uint8Array> {
-  if (inputFormat.internal === "woff2") return await decompress(inputFile.bytes);
-  else if (inputFormat.internal === "svg") return svgToOtf(inputFile, decoder).bytes;
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (inputFormat.internal === "woff2") return ownedBytes(await decompress(inputFile.bytes));
+  else if (inputFormat.internal === "svg") return svgToOtf(inputFile).bytes;
 
   return inputFile.bytes;
 }
 
 class fontHandler implements FormatHandler {
-  public name: string = "font";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "font";
+  public supportedFormats = [
+    Formats.TTF.builder("ttf").lossless().from(),
+    Formats.OTF.builder("otf").lossless().fromTo(),
+    Formats.WOFF.builder("woff").lossless().from(),
+    Formats.WOFF2.builder("woff2").lossless().fromTo(),
+    Formats.SVG.builder("svg").fromTo(), // svg fonts lose a lot of font metadata, since they only convert the glyphs, so we can't mark it as lossless
+  ];
+  public ready = false;
 
   async init() {
-    this.supportedFormats = [
-      CommonFormats.TTF.builder("ttf").allowFrom().markLossless(),
-      CommonFormats.OTF.builder("otf").allowFrom().allowTo().markLossless(),
-      CommonFormats.WOFF.builder("woff").allowFrom().markLossless(),
-      CommonFormats.WOFF2.builder("woff2").allowFrom().allowTo().markLossless(),
-      CommonFormats.SVG.builder("svg").allowFrom().allowTo(), // svg fonts lose a lot of font metadata, since they only convert the glyphs, so we can't mark it as lossless
-    ];
     this.ready = true;
   }
 
@@ -253,13 +251,11 @@ class fontHandler implements FormatHandler {
       throw new TypeError(`Unsupported output format: ${outputFormat.internal}`);
 
     const outputFiles: FileData[] = [];
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
 
     for (const inputFile of inputFiles) {
-      const nFile = { ...inputFile, bytes: await normalizeToSfnt(inputFile, inputFormat, decoder) };
+      const nFile = { ...inputFile, bytes: await normalizeToSfnt(inputFile, inputFormat) };
 
-      if (outputFormat.internal === "svg") outputFiles.push(sfntToSvg(nFile, encoder));
+      if (outputFormat.internal === "svg") outputFiles.push(sfntToSvg(nFile));
       else if (outputFormat.internal === "otf") outputFiles.push(sfntToOtf(nFile));
       else if (outputFormat.internal === "woff2") outputFiles.push(await sfntToWoff2(nFile));
     }

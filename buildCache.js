@@ -1,4 +1,5 @@
 import puppeteer from "puppeteer";
+import { preview } from "vite";
 
 const minify = process.argv[3] === "--minify";
 
@@ -9,16 +10,7 @@ if (await outputFile.exists()) {
   await outputFile.delete();
 }
 
-const server = Bun.serve({
-  async fetch(req) {
-    const path = new URL(req.url).pathname.replace("/convert/", "") || "index.html";
-    if (path === "cache.json") return new Response("", { status: 204 }); // to better match the real server
-    const file = Bun.file(`${__dirname}/dist/${path}`.replaceAll("..", ""));
-    if (!(await file.exists())) return new Response("Not Found", { status: 404 });
-    return new Response(file);
-  },
-  port: 0,
-});
+const server = await preview({ logLevel: "silent", preview: { port: 0 } });
 
 const browser = await puppeteer.launch({
   headless: "new",
@@ -27,27 +19,39 @@ const browser = await puppeteer.launch({
 
 const page = await browser.newPage();
 
-await Promise.all([
-  new Promise((resolve) => {
-    page.on("console", (msg) => {
-      const text = msg.text();
-      if (msg.type() === "error") console.error(text);
-      if (text === "Built initial format list.") resolve();
-    });
-  }),
-  page.goto(`http://localhost:${server.port}/convert/index.html`),
-]);
+const TIMEOUT_MS = 10 * 60 * 1000;
+let timeout;
 
-const cacheJSON = await page.evaluate((minify) => {
-  if (minify === true) {
-    return JSON.stringify(JSON.parse(window.printSupportedFormatCache()));
-  }
-  return window.printSupportedFormatCache();
-}, minify);
+try {
+  await Promise.all([
+    new Promise((resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("Timed out waiting for the format list.")),
+        TIMEOUT_MS,
+      );
+      page.on("pageerror", (error) => console.error(error));
+      page.on("console", (msg) => {
+        const text = msg.text();
+        if (msg.type() === "error") console.error(text);
+        if (text === "Built initial format list.") resolve();
+        if (text.startsWith("Failed to build initial format list.")) reject(new Error(text));
+      });
+    }),
+    page.goto(server.resolvedUrls.local[0]),
+  ]);
 
-await Bun.write(outputPath, cacheJSON);
+  const cacheJSON = await page.evaluate((minify) => {
+    if (minify) {
+      return JSON.stringify(JSON.parse(window.printSupportedFormatCache()));
+    }
+    return window.printSupportedFormatCache();
+  }, minify);
 
-await browser.close();
-server.stop();
+  await Bun.write(outputPath, cacheJSON);
+} finally {
+  clearTimeout(timeout);
+  await browser.close();
+  await server.close();
+}
 
 console.log("All done.");

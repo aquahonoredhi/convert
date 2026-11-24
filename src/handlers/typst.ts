@@ -1,7 +1,11 @@
-import CommonFormats from "src/CommonFormats.ts";
+import Formats from "src/Formats.ts";
 import type { FileData, FileFormat, FormatHandler } from "../FormatHandler.ts";
+import type { ConvertContext } from "src/ui/ProgressStore.ts";
 import type { TypstSnippet } from "@myriaddreamin/typst.ts/dist/esm/contrib/snippet.mjs";
+import typstCompilerWasmUrl from "@myriaddreamin/typst-ts-web-compiler/wasm?url";
+import typstRendererWasmUrl from "@myriaddreamin/typst-ts-renderer/wasm?url";
 import { InitializationError } from "src/errors.ts";
+import { changeExt, decode, encode, isStringRecord } from "src/common/index.ts";
 
 export const TYPST_PAGEBREAK_MARKER = "CONVERTTYPSTPAGEBREAKTOKEN";
 export const TYPST_ASSET_MANIFEST_START = "// convert-assets-start";
@@ -208,18 +212,6 @@ export function postprocessTypstFromPandoc(typstContent: string): string {
   );
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-
-  return btoa(binary);
-}
-
 export async function collectTypstAssetFiles(
   files: Record<string, any>,
   excludedPaths: string[] = [],
@@ -231,8 +223,7 @@ export async function collectTypstAssetFiles(
     if (excluded.has(path)) continue;
     if (!(file instanceof Blob)) continue;
 
-    const arrayBuffer = await file.arrayBuffer();
-    bundledAssets[path] = new Uint8Array(arrayBuffer);
+    bundledAssets[path] = await file.bytes();
   }
 
   return bundledAssets;
@@ -248,7 +239,7 @@ export async function bundleTypstAssets(
 
   if (assetPaths.length === 0) return typstContent;
   const bundledAssets = Object.fromEntries(
-    Object.entries(shadowFiles).map(([path, bytes]) => [path, bytesToBase64(bytes)]),
+    Object.entries(shadowFiles).map(([path, bytes]) => [path, bytes.toBase64()]),
   );
 
   return [
@@ -258,17 +249,6 @@ export async function bundleTypstAssets(
     "",
     typstContent,
   ].join("\n");
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  return bytes;
 }
 
 export function unpackTypstAssets(mainContent: string): {
@@ -297,9 +277,10 @@ export function unpackTypstAssets(mainContent: string): {
     return { mainContent: strippedContent, shadowFiles: {} };
   }
 
-  const parsedManifest = JSON.parse(manifestRaw) as Record<string, string>;
+  const parsedManifest: unknown = JSON.parse(manifestRaw);
+  if (!isStringRecord(parsedManifest)) throw new Error("Invalid Typst asset manifest.");
   const shadowFiles = Object.fromEntries(
-    Object.entries(parsedManifest).map(([path, base64]) => [path, base64ToBytes(base64)]),
+    Object.entries(parsedManifest).map(([path, base64]) => [path, Uint8Array.fromBase64(base64)]),
   );
 
   return {
@@ -309,7 +290,7 @@ export function unpackTypstAssets(mainContent: string): {
 }
 
 function parseSvgPageDimensions(svgBytes: Uint8Array): { widthPt: number; heightPt: number } {
-  const head = new TextDecoder().decode(svgBytes.slice(0, 16384));
+  const head = decode(svgBytes.slice(0, 16384));
   const wAttr = head.match(/\bwidth="([\d.]+)\s*(?:px|pt)?"/i);
   const hAttr = head.match(/\bheight="([\d.]+)\s*(?:px|pt)?"/i);
   const vb = head.match(/viewBox="\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)\s*"/i);
@@ -329,33 +310,42 @@ function parseSvgPageDimensions(svgBytes: Uint8Array): { widthPt: number; height
 }
 
 class typstHandler implements FormatHandler {
-  public name: string = "typst";
-  public ready: boolean = false;
-  public offload: boolean = true;
-
-  public supportedFormats: FileFormat[] = [
-    CommonFormats.TYPST.supported("typst", true, false, true),
-    CommonFormats.PDF.supported("pdf", false, true, true),
-    CommonFormats.SVG.supported("svg", true, true, false),
+  public readonly name = "typst";
+  public supportedFormats = [
+    Formats.TYPST.builder("typst").lossless().from(),
+    Formats.PDF.builder("pdf").lossless().to(),
+    Formats.SVG.builder("svg").fromTo(),
   ];
+  public ready = false;
+  public abortable = true;
 
   private $typst?: TypstSnippet;
 
   async init() {
-    const { $typst: typst } = await import("@myriaddreamin/typst.ts/dist/esm/contrib/snippet.mjs");
+    const { $typst: typst, TypstSnippet } =
+      await import("@myriaddreamin/typst.ts/dist/esm/contrib/snippet.mjs");
 
+    typst.use(
+      TypstSnippet.preloadFontAssets({
+        assets: ["text"],
+        assetUrlPrefix: new URL("external/typst/", globalThis.baseUrl).href,
+      }),
+    );
     typst.setCompilerInitOptions({
-      getModule: () => `${import.meta.env.BASE_URL}wasm/typst_ts_web_compiler_bg.wasm`,
+      getModule: () => typstCompilerWasmUrl,
     });
     typst.setRendererInitOptions({
-      getModule: () => `${import.meta.env.BASE_URL}wasm/typst_ts_renderer_bg.wasm`,
+      getModule: () => typstRendererWasmUrl,
     });
 
     this.$typst = typst;
     this.ready = true;
   }
 
-  private async svgFilesToSinglePdf(inputFiles: FileData[]): Promise<FileData[]> {
+  private async svgFilesToSinglePdf(
+    inputFiles: FileData[],
+    ctx?: ConvertContext,
+  ): Promise<FileData[]> {
     const $typst = this.$typst!;
     const dimensions = inputFiles.map((file) => parseSvgPageDimensions(file.bytes));
 
@@ -382,12 +372,12 @@ class typstHandler implements FormatHandler {
     const mainContent = body;
 
     try {
+      await ctx?.checkpoint();
       const pdfData = await $typst.pdf({ mainContent });
       if (!pdfData) throw new Error("Typst compilation to PDF failed.");
-      const baseName = inputFiles[0].name.replace(/\.[^.]+$/u, "");
       return [
         {
-          name: `${baseName}.pdf`,
+          name: changeExt(inputFiles[0].name, "pdf"),
           bytes: new Uint8Array(pdfData),
         },
       ];
@@ -403,6 +393,7 @@ class typstHandler implements FormatHandler {
     inputFiles: FileData[],
     inputFormat: FileFormat,
     outputFormat: FileFormat,
+    ctx?: ConvertContext,
   ): Promise<FileData[]> {
     if (!this.ready || !this.$typst) throw new InitializationError("Handler not initialized.");
 
@@ -414,14 +405,14 @@ class typstHandler implements FormatHandler {
     }
 
     if (inputFormat.internal === "svg" && outputFormat.internal === "pdf") {
-      return this.svgFilesToSinglePdf(inputFiles);
+      return this.svgFilesToSinglePdf(inputFiles, ctx);
     }
 
     const outputFiles: FileData[] = [];
 
     for (const file of inputFiles) {
-      const { mainContent, shadowFiles } = unpackTypstAssets(new TextDecoder().decode(file.bytes));
-      const baseName = file.name.replace(/\.[^.]+$/u, "");
+      await ctx?.checkpoint();
+      const { mainContent, shadowFiles } = unpackTypstAssets(decode(file.bytes));
       await this.$typst.resetShadow();
 
       for (const [path, bytes] of Object.entries(shadowFiles)) {
@@ -429,7 +420,8 @@ class typstHandler implements FormatHandler {
         await this.$typst.mapShadow(`/${cleanPath}`, bytes);
       }
 
-      await this.$typst.mapShadow("/main.typ", new TextEncoder().encode(mainContent));
+      await this.$typst.mapShadow("/main.typ", encode(mainContent));
+      await ctx?.checkpoint();
 
       if (outputFormat.internal === "pdf") {
         const pdfData = await this.$typst.pdf({
@@ -438,7 +430,7 @@ class typstHandler implements FormatHandler {
         });
         if (!pdfData) throw new Error("Typst compilation to PDF failed.");
         outputFiles.push({
-          name: `${baseName}.pdf`,
+          name: changeExt(file.name, "pdf"),
           bytes: new Uint8Array(pdfData),
         });
       } else if (outputFormat.internal === "svg") {
@@ -447,8 +439,8 @@ class typstHandler implements FormatHandler {
           root: "/",
         });
         outputFiles.push({
-          name: `${baseName}.svg`,
-          bytes: new TextEncoder().encode(svgString),
+          name: changeExt(file.name, "svg"),
+          bytes: encode(svgString),
         });
       }
     }

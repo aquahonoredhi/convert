@@ -1,42 +1,21 @@
 import type { FileData, FileFormat, FormatHandler } from "src/FormatHandler.ts";
 import * as NBT from "nbtify";
-import CommonFormats, { Category } from "src/CommonFormats.ts";
-import { gzipSync } from "fflate";
+import Formats from "src/Formats.ts";
+import { changeExt, decode, encode, ownedBytes } from "src/common/index.ts";
+import { compressGzip } from "src/common/gzip.ts";
 
 class nbtHandler implements FormatHandler {
-  public name: string = "nbt";
-  public supportedFormats?: FileFormat[];
-  public ready: boolean = false;
-  public offload: boolean = true;
+  public readonly name = "nbt";
+  public supportedFormats = [
+    Formats.NBT.builder("nbt").lossless().fromTo(),
+    Formats.JSON.builder("json").lossless().fromTo(),
+    Formats.SNBT.builder("snbt").lossless().fromTo(), // only compression data is lost
+  ];
+  public ready = false;
 
   public indent: number = 2;
 
   async init() {
-    this.supportedFormats = [
-      {
-        name: "Named Binary Tag",
-        format: "nbt",
-        extension: "nbt",
-        mime: "application/x-minecraft-nbt",
-        from: true,
-        to: true,
-        internal: "nbt",
-        category: Category.DATA,
-        lossless: true,
-      },
-      CommonFormats.JSON.supported("json", true, true, true),
-      {
-        name: "String Named Binary Tag",
-        format: "snbt",
-        extension: "snbt",
-        mime: "application/x-minecraft-snbt",
-        from: true,
-        to: true,
-        internal: "snbt",
-        category: Category.DATA,
-        lossless: true, // only compression data is lost
-      },
-    ];
     this.ready = true;
   }
 
@@ -46,8 +25,6 @@ class nbtHandler implements FormatHandler {
     outputFormat: FileFormat,
   ): Promise<FileData[]> {
     const outputFiles: FileData[] = [];
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
 
     // nbt -> json
     if (inputFormat.internal === "nbt" && outputFormat.internal === "json") {
@@ -59,8 +36,8 @@ class nbtHandler implements FormatHandler {
           this.indent,
         );
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + ".json",
-          bytes: encoder.encode(j),
+          name: changeExt(file.name, "json"),
+          bytes: encode(j),
         });
       }
     }
@@ -68,12 +45,12 @@ class nbtHandler implements FormatHandler {
     // json -> nbt
     if (inputFormat.internal === "json" && outputFormat.internal === "nbt") {
       for (const file of inputFiles) {
-        const text = decoder.decode(file.bytes);
+        const text = decode(file.bytes);
         const obj = JSON.parse(text);
         const bd = await NBT.write(obj);
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + `.${outputFormat.extension}`,
-          bytes: bd,
+          name: changeExt(file.name, outputFormat.extension),
+          bytes: ownedBytes(bd),
         });
       }
     }
@@ -81,12 +58,12 @@ class nbtHandler implements FormatHandler {
     // snbt -> nbt
     if (inputFormat.internal === "snbt" && outputFormat.internal === "nbt") {
       for (const file of inputFiles) {
-        const text = decoder.decode(file.bytes);
+        const text = decode(file.bytes);
         const nbt = NBT.parse(text);
         const bd = await NBT.write(nbt);
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + `.${outputFormat.extension}`,
-          bytes: bd,
+          name: changeExt(file.name, outputFormat.extension),
+          bytes: ownedBytes(bd),
         });
       }
     }
@@ -98,8 +75,8 @@ class nbtHandler implements FormatHandler {
           space: this.indent,
         });
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + ".snbt",
-          bytes: encoder.encode(text),
+          name: changeExt(file.name, "snbt"),
+          bytes: encode(text),
         });
       }
     }
@@ -111,8 +88,8 @@ class nbtHandler implements FormatHandler {
     ) {
       for (const file of inputFiles) {
         outputFiles.push({
-          name: file.name.split(".").slice(0, -1).join(".") + `.${outputFormat.extension}`,
-          bytes: gzipSync(file.bytes),
+          name: changeExt(file.name, outputFormat.extension),
+          bytes: await compressGzip(file.bytes),
         });
       }
     }
